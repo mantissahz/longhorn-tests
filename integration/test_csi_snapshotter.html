@@ -30,6 +30,7 @@
 from urllib.parse import urlparse
 
 import pytest
+import common
 from backupstore import backupstore_s3  # NOQA
 from backupstore import set_random_backupstore  # NOQA
 from common import RETRY_COUNTS
@@ -52,6 +53,19 @@ from common import wait_for_backup_delete
 from common import wait_for_volume_detached
 from common import wait_for_volume_restoration_completed
 from kubernetes.client.rest import ApiException
+from common import generate_volume_name, Mi, wait_and_get_pv_for_pvc, create_pvc # NOQA
+from common import make_deployment_with_pvc, apps_api # NOQA
+from common import check_pvc_in_specific_status # NOQA
+from common import wait_for_pvc_phase
+from common import RETRY_COMMAND_COUNT
+from common import BACKING_IMAGE_QCOW2_URL, BACKING_IMAGE_QCOW2_CHECKSUM
+from common import BACKING_IMAGE_RAW_URL, BACKING_IMAGE_RAW_CHECKSUM
+from common import BACKING_IMAGE_SOURCE_TYPE_DOWNLOAD, RETRY_COUNTS_SHORT
+from common import BACKING_IMAGE_STATE_READY, BACKING_IMAGE_NAME
+from common import wait_for_backing_image_status, exec_command_in_pod
+from common import delete_and_wait_pod, delete_and_wait_pvc
+from common import BACKING_IMAGE_SOURCE_TYPE_FROM_VOLUME
+from common import create_backing_image_with_matching_url
 
 
 @pytest.fixture
@@ -63,7 +77,7 @@ def volumesnapshotclass(request):
         def create_volumesnapshotclass(name, deletepolicy, snapshot_type=None):
             manifest = {
                 &#39;kind&#39;: &#39;VolumeSnapshotClass&#39;,
-                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1beta1&#39;,
+                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1&#39;,
                 &#39;metadata&#39;: {
                   &#39;name&#39;: name
                 },
@@ -125,7 +139,7 @@ def volumesnapshot(request):
                                   source_type,
                                   source_name):
             manifest = {
-                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1beta1&#39;,
+                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1&#39;,
                 &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
                 &#39;metadata&#39;: {
                   &#39;name&#39;: name,
@@ -206,7 +220,7 @@ def volumesnapshotcontent(request):
                                          volumesnapshot_ref_name,
                                          volumesnapshot_ref_namespace):
             manifest = {
-                &#34;apiVersion&#34;: &#34;snapshot.storage.k8s.io/v1beta1&#34;,
+                &#34;apiVersion&#34;: &#34;snapshot.storage.k8s.io/v1&#34;,
                 &#34;kind&#34;: &#34;VolumeSnapshotContent&#34;,
                 &#34;metadata&#34;: {
                   &#34;name&#34;: name,
@@ -277,7 +291,7 @@ def volumesnapshotcontent(request):
 def get_volumesnapshotcontent(volumesnapshot_uid):
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshotcontents&#34;
 
     volumesnapshotcontents = \
@@ -292,10 +306,36 @@ def get_volumesnapshotcontent(volumesnapshot_uid):
     return v
 
 
+def wait_volumesnapshot_deleted(name,
+                                namespace,
+                                retry_counts=RETRY_COMMAND_COUNT,
+                                can_be_deleted=True):
+    api = get_custom_object_api_client()
+    api_group = &#34;snapshot.storage.k8s.io&#34;
+    api_version = &#34;v1&#34;
+    plural = &#34;volumesnapshots&#34;
+
+    deleted = False
+
+    for i in range(retry_counts):
+        try:
+            api.get_namespaced_custom_object(group=api_group,
+                                             version=api_version,
+                                             namespace=namespace,
+                                             plural=plural,
+                                             name=name)
+        except Exception:
+            deleted = True
+            break
+        time.sleep(RETRY_INTERVAL)
+
+    assert deleted == can_be_deleted
+
+
 def delete_volumesnapshot(name, namespace):
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshots&#34;
 
     try:
@@ -311,7 +351,7 @@ def delete_volumesnapshot(name, namespace):
 def wait_for_volumesnapshot_ready(volumesnapshot_name, namespace, ready_to_use=True): # NOQA
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshots&#34;
 
     for i in range(RETRY_COUNTS):
@@ -330,7 +370,7 @@ def wait_for_volumesnapshot_ready(volumesnapshot_name, namespace, ready_to_use=T
     return v
 
 
-def restore_csi_volume_snapshot(core_api, client, csivolsnap, pvc_name, pvc_request_storage_size): # NOQA
+def restore_csi_volume_snapshot(core_api, client, csivolsnap, pvc_name, pvc_request_storage_size, wait_for_restore=True): # NOQA
     restore_pvc = {
         &#39;apiVersion&#39;: &#39;v1&#39;,
         &#39;kind&#39;: &#39;PersistentVolumeClaim&#39;,
@@ -374,7 +414,8 @@ def restore_csi_volume_snapshot(core_api, client, csivolsnap, pvc_name, pvc_requ
 
     assert restore_volume_name is not None
 
-    wait_for_volume_restoration_completed(client, restore_volume_name)
+    if wait_for_restore is True:
+        wait_for_volume_restoration_completed(client, restore_volume_name)
     wait_for_volume_detached(client, restore_volume_name)
 
     return restore_pvc
@@ -673,13 +714,75 @@ def test_csi_snapshot_with_bak_param(set_random_backupstore, # NOQA
                                   csi_snapshot_type=&#39;bak&#39;)
 
 
-@pytest.mark.skip(reason=&#34;TODO&#34;) # NOQA
-def test_csi_snapshot_with_snap_param(client, volume_name): # NOQA
+def prepare_test_csi_snapshot(apps_api, # NOQA
+                              client, # NOQA
+                              make_deployment_with_pvc, # NOQA
+                              volumesnapshotclass, # NOQA
+                              core_api, # NOQA
+                              ): # NOQA
     &#34;&#34;&#34;
     Context:
 
     After deploy the CSI snapshot CRDs, Controller at
-    https://longhorn.io/docs/1.2.3/snapshots-and-backups/
+    https://longhorn.io/docs/&lt;longhorn version&gt;/snapshots-and-backups/
+    csi-snapshot-support/enable-csi-snapshot-support/
+
+    Create VolumeSnapshotClass with type=snap
+      - longhorn-snapshot (type=snap)
+    Create Longhorn volume test-vol
+      - Size 5GB
+      - Create PV/PVC/Workload for the Longhorn volume
+      - Write data into volume
+      - Setup backup store
+    &#34;&#34;&#34;
+    csi_snapshot_type = &#34;snap&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=&#34;snapshotclass-snap&#34;,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    vol = common.create_and_check_volume(client, generate_volume_name(),
+                                         size=str(500 * Mi))
+
+    pv_name = vol.name + &#34;-pv&#34;
+    common.create_pv_for_volume(client, core_api, vol, pv_name)
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    common.create_pvc_for_volume(client, core_api, vol, pvc_name)
+
+    deployment_name = vol.name + &#34;-dep&#34;
+    deployment = make_deployment_with_pvc(deployment_name, pvc_name)
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=deployment, namespace=&#39;default&#39;)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api, deployment_name)
+    common.write_pod_volume_random_data(core_api, pod.metadata.name,
+                                        data_path, common.DATA_SIZE_IN_MB_2)
+    expected_md5sum = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                          data_path)
+
+    return vol, deployment, csisnapclass, expected_md5sum
+
+
+def test_csi_snapshot_snap_create_csi_snapshot(apps_api, # NOQA
+                                      client, # NOQA
+                                      make_deployment_with_pvc, # NOQA
+                                      volume_name, # NOQA
+                                      volumesnapshotclass, # NOQA
+                                      volumesnapshot, # NOQA
+                                      csi_pv, # NOQA
+                                      pvc, # NOQA
+                                      core_api, # NOQA
+                                      pod_make): # NOQA
+    &#34;&#34;&#34;
+    Context:
+
+    After deploy the CSI snapshot CRDs, Controller at
+    https://longhorn.io/docs/1.4.2/snapshots-and-backups/
     csi-snapshot-support/enable-csi-snapshot-support/
 
     Create VolumeSnapshotClass with type=snap
@@ -698,41 +801,362 @@ def test_csi_snapshot_with_snap_param(client, volume_name): # NOQA
         - Volume is in detached state
             - Scale down the workload
             - Create VolumeSnapshot with class longhorn-snap
-            - Verify that the volumesnapshot object is not ready
+            - Verify that the volumesnapshot object is ready
         - Volume is in attached state
             - Scale up the workload
             - Verify the Longhorn snapshot generated
-    2. Test create new volume from CSI snapshot
+    &#34;&#34;&#34;
+    # Step 0
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(
+                                  apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api # NOQA
+                                )
+
+    # Step 1 Test create CSI snapshot
+    # Volume is in detached state
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    vol = common.wait_for_volume_detached(client, vol.name)
+
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    # Volume is in attached state
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    vol = common.wait_for_volume_attached(client, vol.name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+
+def test_csi_snapshot_snap_create_volume_from_snapshot(apps_api, # NOQA
+                                      client, # NOQA
+                                      make_deployment_with_pvc, # NOQA
+                                      volume_name, # NOQA
+                                      volumesnapshotclass, # NOQA
+                                      volumesnapshot, # NOQA
+                                      csi_pv, # NOQA
+                                      pvc, # NOQA
+                                      core_api, # NOQA
+                                      pod_make): # NOQA
+    &#34;&#34;&#34;
+    Context:
+
+    After deploy the CSI snapshot CRDs, Controller at
+    https://longhorn.io/docs/1.4.2/snapshots-and-backups/
+    csi-snapshot-support/enable-csi-snapshot-support/
+
+    Create VolumeSnapshotClass with type=snap
+      - longhorn-snapshot (type=snap)
+
+    Test the extend CSI snapshot type=snap support to Longhorn snapshot
+
+    Steps:
+
+    0. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+
+    1. Test create new volume from CSI snapshot
+        - Create VolumeSnapshot with class longhorn-snap
         - Create volume from longhorn-snapshot
             - Source volume is attached &amp;&amp; Longhorn snapshot exist
                 - Create PVC from snapshot generated from step 1
                 - Attach the PVC and verify data
             - Source volume is detached
                 - Scale down the workload
-                - Create PVC from VolumeSnapshot generated from step 1
+                - Create PVC from VolumeSnapshot generated from step beggining
                 - Verify PVC provision failed
-            - Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
                 - Scale up the workload
+                - Wait for PVC to finish provisioning and be bounded
+                - Attach the PVC test-restore-pvc and verify the data
+            - Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
                 - Use VolumeSnapshotContent.snapshotHandle to
-                  specify Longhorn snapshot generated in step 1
+                  specify Longhorn snapshot generated in step beggining
                 - Delete the Longhorn snapshot
-                - Create PVC from VolumeSnapshot generated from step 1
+                - Create PVC from VolumeSnapshot generated from step beggining
                 - PVC should be stuck in provisioning state
-    3. Test delete CSI snapshot
-        - Type is snap
-            - volume is attached &amp;&amp; snapshot doesn’t exist
-                - Delete the VolumeSnapshot
-                - VolumeSnapshot is deleted
-            - volume is attached &amp;&amp; snapshot exist
-                - Verify the creation of Longhorn snapshot with the name in
-                  the field VolumeSnapshotContent.snapshotHandle
-                - Delete the VolumeSnapshot
-                - Verify that Longhorn snapshot is removed or marked as removed
-                - Verify that the VolumeSnapshot is deleted.
-            - volume is detached
-                - Delete the VolumeSnapshot
-                - Verify that VolumeSnapshot is stuck in deleting
     &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(
+                                  apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api # NOQA
+                                 )
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    # Step 1 Test create new volume from CSI snapshot
+    # Source volume is attached &amp;&amp; Longhorn snapshot exist
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#39;longhorn&#39;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    pv_name = wait_and_get_pv_for_pvc(core_api,
+                                      pvc[&#39;metadata&#39;][&#39;name&#39;]).metadata.name
+    new_deployment_name = pv_name + &#34;-dep&#34;
+    new_deployment = make_deployment_with_pvc(new_deployment_name,
+                                              pvc[&#39;metadata&#39;][&#39;name&#39;])
+    new_deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=new_deployment,
+                                          namespace=&#39;default&#39;)
+
+    common.wait_for_volume_status(client, pv_name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api, new_deployment_name)
+    created_md5sum = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                         data_path)
+
+    assert expected_md5sum == created_md5sum
+
+    # Source volume is detached
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_DETACHED)
+
+    new_pvc1 = pvc
+    new_pvc1[&#39;metadata&#39;][&#39;name&#39;] = pvc[&#39;metadata&#39;][&#39;name&#39;] + &#34;new-pvc1&#34;
+    create_pvc(new_pvc1)
+
+    wait_for_pvc_phase(core_api, new_pvc1[&#39;metadata&#39;][&#39;name&#39;], &#34;Bound&#34;)
+    pv_name_2 = \
+        wait_and_get_pv_for_pvc(core_api,
+                                new_pvc1[&#39;metadata&#39;][&#39;name&#39;]).metadata.name
+
+    new_deployment_name_2 = pv_name_2 + &#34;-dep-2&#34;
+    new_deployment_2 = make_deployment_with_pvc(new_deployment_name_2,
+                                                new_pvc1[&#39;metadata&#39;][&#39;name&#39;])
+    new_deployment_2[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=new_deployment_2,
+                                          namespace=&#39;default&#39;)
+
+    common.wait_for_volume_status(client, pv_name_2,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api,
+                                                 new_deployment_name_2)
+    created_md5sum_2 = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                           data_path)
+
+    assert expected_md5sum == created_md5sum_2
+
+    # Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    vol = client.by_id_volume(vol.name)
+    # create new snapshot to avoid the case the volume only has 1
+    # snapshot so the snapshot can not deleted
+    vol.snapshotCreate()
+    snapshot_content = get_volumesnapshotcontent(csivolsnap[&#34;metadata&#34;][&#34;uid&#34;])
+    snap_name = snapshot_content[&#34;status&#34;][&#34;snapshotHandle&#34;]
+
+    snapshots = vol.snapshotList()
+    for item in snapshots:
+        if item.name in snap_name:
+            vol.snapshotDelete(name=item.name)
+    vol.snapshotPurge()
+
+    new_pvc2 = pvc
+    new_pvc2[&#39;metadata&#39;][&#39;name&#39;] = pvc[&#39;metadata&#39;][&#39;name&#39;] + &#34;new-pvc2&#34;
+    create_pvc(new_pvc2)
+    check_pvc_in_specific_status(core_api,
+                                 new_pvc2[&#39;metadata&#39;][&#39;name&#39;], &#34;Pending&#34;)
+
+
+def test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist(apps_api, # NOQA
+                                                              client, # NOQA
+                                                              make_deployment_with_pvc, # NOQA
+                                                              volumesnapshotclass, # NOQA
+                                                              volumesnapshot, # NOQA
+                                                              core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is attached &amp;&amp; snapshot exist
+            - Verify the creation of Longhorn snapshot with the name in
+                the field VolumeSnapshotContent.snapshotHandle
+            - Delete the VolumeSnapshot
+            - Verify that Longhorn snapshot is removed or marked as removed
+            - Verify that the VolumeSnapshot is deleted.
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+
+def test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist(apps_api, # NOQA
+                                                                  client, # NOQA
+                                                                  make_deployment_with_pvc, # NOQA
+                                                                  volumesnapshotclass, # NOQA
+                                                                  volumesnapshot, # NOQA
+                                                                  core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is attached &amp;&amp; snapshot doesn’t exist
+            - Delete the VolumeSnapshot
+            - VolumeSnapshot is deleted
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    vol = client.by_id_volume(vol.name)
+    snapshots = vol.snapshotList()
+    vol.snapshotDelete(name=snapshots[0].name)
+    vol.snapshotPurge()
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+
+def test_csi_snapshot_snap_delete_csi_snapshot_volume_detached(apps_api, # NOQA
+                                                               client, # NOQA
+                                                               make_deployment_with_pvc, # NOQA
+                                                               volumesnapshotclass, # NOQA
+                                                               volumesnapshot, # NOQA
+                                                               core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is detached
+            - Delete the VolumeSnapshot
+            - Verify that VolumeSnapshot is stuck in deleting
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot-3&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    wait_for_volume_detached(client, vol.name)
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;default&#34;,
+                                can_be_deleted=True)
 
 
 def test_csi_snapshot_with_invalid_param(
@@ -797,6 +1221,477 @@ def test_csi_snapshot_with_invalid_param(
         delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
                               &#39;default&#39;)
 
+    request.addfinalizer(finalizer)
+
+
+def test_csi_volumesnapshot_backing_image_basic(client, # NOQA
+                                                core_api, # NOQA
+                                                csi_pv, # NOQA
+                                                pod_make, # NOQA
+                                                pvc, # NOQA
+                                                request, # NOQA
+                                                volume_name, # NOQA
+                                                volumesnapshotclass, # NOQA
+                                                volumesnapshot): # NOQA
+    &#34;&#34;&#34;
+    Test Create/Delete BackingImage using VolumeSnapshot with a given Volume
+
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
+
+    Given
+    - The Volume attached to a workload, having data and computed md5sum.
+
+    When
+    - Creating the VolumeSnapshot
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                persistentVolumeClaimName: test-vol
+        ```
+
+    Then
+    - A BackingImage is created with the following properties
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: `snapshot-${VolumeSnapshot.uuid}`
+            namespace: longhorn-system
+        spec:
+            sourceType: export-from-volume
+            sourceParameters:
+                volume-name: test-vol
+                export-type: raw
+        ```
+
+    When
+    - Creating a PVC with dataSource pointing to the VolumeSnapshot
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-pvc
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                storage: 5Gi
+        ```
+
+    Then
+    - A Volume is created using BackingImage snapshot-${VolumeSnapshot.uuid}
+    - Verifying the data and md5sum in the new Volume
+
+    When
+    - Delete the new Volume from the the VolumeSnapshot
+    - Delete the VolumeSnapshot
+        ```
+        &gt; kubectl delete vs/test-snapshot-backing
+        ```
+
+    Then
+    - The BackingImage is deleted as well
+    &#34;&#34;&#34;
+    csi_snapshot_type = &#34;bi&#34;
+    storage_class_name = &#34;longhorn-snapshot-vsc&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=storage_class_name,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    pod_name, pv_name, pvc_name, md5sum = \
+        prepare_pod_with_data_in_mb(client, core_api,
+                                    csi_pv, pvc, pod_make,
+                                    volume_name,
+                                    data_path=&#34;/data/test&#34;)
+
+    csivolsnap_name = &#34;test-snapshot-backing&#34;
+    csivolsnap_namespace = &#34;default&#34;
+    csivolsnap = volumesnapshot(csivolsnap_name,
+                                csivolsnap_namespace,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    backing_images = client.list_backing_image()
+    assert len(backing_images) == 1
+    wait_for_backing_image_status(client, backing_images[0].name,
+                                  BACKING_IMAGE_STATE_READY)
+    assert backing_images[0].sourceType == BACKING_IMAGE_SOURCE_TYPE_FROM_VOLUME # NOQA
+    assert backing_images[0].parameters[&#34;volume-name&#34;] == pv_name
+    assert not backing_images[0].deletionTimestamp
+    assert len(backing_images[0].diskFileStatusMap) == 1
+
+    restore_pvc_name = &#34;test-restore-pvc&#34;
+    restore_pvc_size = pvc[&#34;spec&#34;][&#34;resources&#34;][&#34;requests&#34;][&#34;storage&#34;]
+    restore_csi_volume_snapshot(core_api,
+                                client,
+                                csivolsnap,
+                                restore_pvc_name,
+                                restore_pvc_size,
+                                wait_for_restore=False)
+
+    restore_pod = pod_make()
+    restore_pod_name = restore_pod[&#34;metadata&#34;][&#34;name&#34;]
+    restore_pod[&#39;spec&#39;][&#39;volumes&#39;] = [create_pvc_spec(restore_pvc_name)]
+
+    create_and_wait_pod(core_api, restore_pod)
+    restore_md5sum = \
+        get_pod_data_md5sum(core_api, restore_pod_name, path=&#34;/data/test&#34;)
+    assert restore_md5sum == md5sum
+
+    &#34;&#34;&#34;
+    Delete volumesnapshot will also delete correspond backing image.
+    The deletion will stuck if backing images in use.
+
+    Add finalizer make backing image not in use before delete volumesnapshot.
+
+    https://github.com/longhorn/longhorn/issues/6266#issuecomment-1628474916
+    &#34;&#34;&#34;
+    def finalizer():
+        delete_and_wait_pod(core_api, pod_name)
+        delete_and_wait_pvc(core_api, pvc_name)
+        delete_and_wait_pod(core_api, restore_pod_name)
+        delete_and_wait_pvc(core_api, restore_pvc_name)
+        delete_volumesnapshot(csivolsnap_name, &#34;default&#34;)
+        wait_volumesnapshot_deleted(csivolsnap_name,
+                                    &#34;default&#34;,
+                                    retry_counts=RETRY_COUNTS_SHORT)
+
+    request.addfinalizer(finalizer)
+
+
+@pytest.mark.parametrize(&#34;bi_url, bi_checksum&#34;, [(BACKING_IMAGE_QCOW2_URL, BACKING_IMAGE_QCOW2_CHECKSUM), (BACKING_IMAGE_RAW_URL, BACKING_IMAGE_RAW_CHECKSUM)]) # NOQA
+def test_csi_volumesnapshot_restore_pre_provision_backing_image(bi_url, # NOQA
+                                                                bi_checksum, # NOQA
+                                                                client, # NOQA
+                                                                core_api, # NOQA
+                                                                pod_make, # NOQA
+                                                                pvc, # NOQA
+                                                                request, # NOQA
+                                                                volumesnapshotclass, # NOQA
+                                                                volumesnapshotcontent, # NOQA
+                                                                volumesnapshot): # NOQA
+    &#34;&#34;&#34;
+    Test Restore Volume from CSI VolumeSnapshot with existing BackingImage
+
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
+
+    Given
+    - Creating a BackingImage
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: test-bi
+            namespace: longhorn-system
+        spec:
+            sourceType: download
+            sourceParameters:
+                url: https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2  # NOQA
+            checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+        ```
+    - Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage
+      - (snapshotHandle was dynamic with 2 different of backing images in test script)
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotContent
+        metadata:
+            name: test-existing-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            driver: driver.longhorn.io
+            deletionPolicy: Delete
+            source:
+                snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+            volumeSnapshotRef:
+                name: test-snapshot-existing-backing
+                namespace: default
+        ```
+
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-existing-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                volumeSnapshotContentName: test-existing-backing
+        ```
+    When
+    - Creating the PVC
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-existing-backing
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-existing-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                    storage: 5Gi
+        ```
+
+    Then
+    - A Volume is created using the BackingImage `test-bi`
+    - Verify the data (Directories of the backing images) exists in the mount point.
+    &#34;&#34;&#34;
+    create_backing_image_with_matching_url(client, BACKING_IMAGE_NAME, bi_url)
+
+    csivolsnap, csivolsnap_name = prepare_bi_type_test(bi_checksum,
+                                                       bi_url,
+                                                       volumesnapshotclass,
+                                                       volumesnapshotcontent,
+                                                       volumesnapshot)
+
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#34;longhorn&#34;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api,
+                                                              csivolsnap_name,
+                                                              pod_make,
+                                                              pvc,
+                                                              request)
+
+
+@pytest.mark.parametrize(&#34;bi_url, bi_checksum&#34;, [(BACKING_IMAGE_QCOW2_URL, BACKING_IMAGE_QCOW2_CHECKSUM), (BACKING_IMAGE_RAW_URL, BACKING_IMAGE_RAW_CHECKSUM)]) # NOQA
+def test_csi_volumesnapshot_restore_on_demand_backing_image(bi_url, # NOQA
+                                                            bi_checksum, # NOQA
+                                                            client, # NOQA
+                                                            core_api, # NOQA
+                                                            pod_make, # NOQA
+                                                            pvc, # NOQA
+                                                            request, # NOQA
+                                                            volumesnapshotclass, # NOQA
+                                                            volumesnapshotcontent, # NOQA
+                                                            volumesnapshot): # NOQA
+    &#34;&#34;&#34;
+    Test Restore Volume from CSI VolumeSnapshot with on-demand BackingImage
+
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
+
+    Given
+    - Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage  # NOQA
+      - (snapshotHandle was dynamic with 2 different of backing images in test script)
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotContent
+        metadata:
+            name: test-on-demand-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            driver: driver.longhorn.io
+            deletionPolicy: Delete
+            source:
+                snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+            volumeSnapshotRef:
+                name: test-snapshot-on-demand-backing
+                namespace: default
+        ```
+
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-on-demand-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                volumeSnapshotContentName: test-on-demand-backing
+        ```
+    When
+    - Creating the PVC
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-on-demand-backing
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-on-demand-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                    storage: 5Gi
+        ```
+    Then
+    - A BackingImage is created (sourceParameters was dynamic in test script)
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: test-bi
+            namespace: longhorn-system
+        spec:
+            sourceType: download
+            sourceParameters:
+                url: https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2  # NOQA
+            checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+        ```
+    - A Volume is created using the BackingImage `test-bi`
+    - Verify the data (Directories of the backing images) exists in the mount point.
+    &#34;&#34;&#34;
+    csivolsnap, csivolsnap_name = prepare_bi_type_test(bi_checksum,
+                                                       bi_url,
+                                                       volumesnapshotclass,
+                                                       volumesnapshotcontent,
+                                                       volumesnapshot)
+
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#34;longhorn&#34;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    for i in range(RETRY_COUNTS_SHORT):
+        try:
+            client.by_id_backing_image(BACKING_IMAGE_NAME)
+        except Exception as err:
+            print(err)
+            time.sleep(RETRY_INTERVAL)
+
+    wait_for_backing_image_status(client, BACKING_IMAGE_NAME,
+                                  BACKING_IMAGE_STATE_READY)
+
+    backing_image = client.by_id_backing_image(BACKING_IMAGE_NAME)
+    assert backing_image.sourceType == BACKING_IMAGE_SOURCE_TYPE_DOWNLOAD
+    assert backing_image.parameters[&#34;url&#34;] == bi_url
+    assert backing_image.currentChecksum == bi_checksum
+    assert not backing_image.deletionTimestamp
+    assert len(backing_image.diskFileStatusMap) == 1
+
+    create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api,
+                                                              csivolsnap_name,
+                                                              pod_make,
+                                                              pvc,
+                                                              request)
+
+
+def prepare_bi_type_test(bi_checksum, bi_url, volumesnapshotclass, volumesnapshotcontent, volumesnapshot): # NOQA
+    csi_snapshot_type = &#34;bi&#34;
+    storage_class_name = &#34;longhorn-snapshot-vsc&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=storage_class_name,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    snapshot_handle = &#34;bi://backing?backingImageDataSourceType=&#34;\
+                      &#34;download&amp;backingImage={0}&amp;&#34;\
+                      &#34;url={1}&amp;&#34;\
+                      &#34;backingImageChecksum={2}&#34;\
+                      .format(BACKING_IMAGE_NAME, bi_url, bi_checksum)
+
+    csivolsnap_name = &#34;test-snapshot-on-demand-backing&#34;
+    csivolsnap_namespace = &#34;default&#34;
+
+    volsnapcontent = \
+        volumesnapshotcontent(&#34;test-on-demand-backing&#34;,
+                              csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                              &#34;Delete&#34;,
+                              snapshot_handle,
+                              csivolsnap_name,
+                              csivolsnap_namespace)
+
+    csivolsnap = volumesnapshot(csivolsnap_name,
+                                csivolsnap_namespace,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;volumeSnapshotContentName&#34;,
+                                volsnapcontent[&#34;metadata&#34;][&#34;name&#34;])
+
+    return csivolsnap, csivolsnap_name
+
+
+def create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api, csivolsnap_name, pod_make, pvc, request): # NOQA
+    pod = pod_make()
+    pod_name = pod[&#34;metadata&#34;][&#34;name&#34;]
+    pod[&#39;spec&#39;][&#39;volumes&#39;] = [create_pvc_spec(pvc[&#39;metadata&#39;][&#39;name&#39;])]
+    create_and_wait_pod(core_api, pod)
+
+    data_path = &#34;/data/guests/&#34;
+    command = &#34;ls -l {} | wc -l&#34;.format(data_path)
+    file_counts = exec_command_in_pod(core_api, command, pod_name, &#39;default&#39;)
+    assert int(file_counts) &gt; 0
+
+    &#34;&#34;&#34;
+    Delete volumesnapshot will also delete correspond backing image.
+    The deletion will stuck if backing images in use.
+
+    Add finalizer make backing image not in use before delete volumesnapshot.
+
+    https://github.com/longhorn/longhorn/issues/6266#issuecomment-1628474916
+    &#34;&#34;&#34;
+    def finalizer():
+        delete_and_wait_pod(core_api, pod_name)
+        delete_and_wait_pvc(core_api, pvc[&#39;metadata&#39;][&#39;name&#39;])
+        delete_volumesnapshot(csivolsnap_name, &#34;default&#34;)
+        wait_volumesnapshot_deleted(csivolsnap_name,
+                                    &#34;default&#34;,
+                                    retry_counts=RETRY_COUNTS_SHORT)
+
     request.addfinalizer(finalizer)</code></pre>
 </details>
 </section>
@@ -807,6 +1702,45 @@ def test_csi_snapshot_with_invalid_param(
 <section>
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
+<dt id="tests.test_csi_snapshotter.create_pod_from_bi_type_volumesnapshot_pvc_and_check_data"><code class="name flex">
+<span>def <span class="ident">create_pod_from_bi_type_volumesnapshot_pvc_and_check_data</span></span>(<span>core_api, csivolsnap_name, pod_make, pvc, request)</span>
+</code></dt>
+<dd>
+<div class="desc"></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api, csivolsnap_name, pod_make, pvc, request): # NOQA
+    pod = pod_make()
+    pod_name = pod[&#34;metadata&#34;][&#34;name&#34;]
+    pod[&#39;spec&#39;][&#39;volumes&#39;] = [create_pvc_spec(pvc[&#39;metadata&#39;][&#39;name&#39;])]
+    create_and_wait_pod(core_api, pod)
+
+    data_path = &#34;/data/guests/&#34;
+    command = &#34;ls -l {} | wc -l&#34;.format(data_path)
+    file_counts = exec_command_in_pod(core_api, command, pod_name, &#39;default&#39;)
+    assert int(file_counts) &gt; 0
+
+    &#34;&#34;&#34;
+    Delete volumesnapshot will also delete correspond backing image.
+    The deletion will stuck if backing images in use.
+
+    Add finalizer make backing image not in use before delete volumesnapshot.
+
+    https://github.com/longhorn/longhorn/issues/6266#issuecomment-1628474916
+    &#34;&#34;&#34;
+    def finalizer():
+        delete_and_wait_pod(core_api, pod_name)
+        delete_and_wait_pvc(core_api, pvc[&#39;metadata&#39;][&#39;name&#39;])
+        delete_volumesnapshot(csivolsnap_name, &#34;default&#34;)
+        wait_volumesnapshot_deleted(csivolsnap_name,
+                                    &#34;default&#34;,
+                                    retry_counts=RETRY_COUNTS_SHORT)
+
+    request.addfinalizer(finalizer)</code></pre>
+</details>
+</dd>
 <dt id="tests.test_csi_snapshotter.delete_volumesnapshot"><code class="name flex">
 <span>def <span class="ident">delete_volumesnapshot</span></span>(<span>name, namespace)</span>
 </code></dt>
@@ -819,7 +1753,7 @@ def test_csi_snapshot_with_invalid_param(
 <pre><code class="python">def delete_volumesnapshot(name, namespace):
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshots&#34;
 
     try:
@@ -844,7 +1778,7 @@ def test_csi_snapshot_with_invalid_param(
 <pre><code class="python">def get_volumesnapshotcontent(volumesnapshot_uid):
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshotcontents&#34;
 
     volumesnapshotcontents = \
@@ -859,8 +1793,8 @@ def test_csi_snapshot_with_invalid_param(
     return v</code></pre>
 </details>
 </dd>
-<dt id="tests.test_csi_snapshotter.restore_csi_volume_snapshot"><code class="name flex">
-<span>def <span class="ident">restore_csi_volume_snapshot</span></span>(<span>core_api, client, csivolsnap, pvc_name, pvc_request_storage_size)</span>
+<dt id="tests.test_csi_snapshotter.prepare_bi_type_test"><code class="name flex">
+<span>def <span class="ident">prepare_bi_type_test</span></span>(<span>bi_checksum, bi_url, volumesnapshotclass, volumesnapshotcontent, volumesnapshot)</span>
 </code></dt>
 <dd>
 <div class="desc"></div>
@@ -868,7 +1802,123 @@ def test_csi_snapshot_with_invalid_param(
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def restore_csi_volume_snapshot(core_api, client, csivolsnap, pvc_name, pvc_request_storage_size): # NOQA
+<pre><code class="python">def prepare_bi_type_test(bi_checksum, bi_url, volumesnapshotclass, volumesnapshotcontent, volumesnapshot): # NOQA
+    csi_snapshot_type = &#34;bi&#34;
+    storage_class_name = &#34;longhorn-snapshot-vsc&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=storage_class_name,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    snapshot_handle = &#34;bi://backing?backingImageDataSourceType=&#34;\
+                      &#34;download&amp;backingImage={0}&amp;&#34;\
+                      &#34;url={1}&amp;&#34;\
+                      &#34;backingImageChecksum={2}&#34;\
+                      .format(BACKING_IMAGE_NAME, bi_url, bi_checksum)
+
+    csivolsnap_name = &#34;test-snapshot-on-demand-backing&#34;
+    csivolsnap_namespace = &#34;default&#34;
+
+    volsnapcontent = \
+        volumesnapshotcontent(&#34;test-on-demand-backing&#34;,
+                              csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                              &#34;Delete&#34;,
+                              snapshot_handle,
+                              csivolsnap_name,
+                              csivolsnap_namespace)
+
+    csivolsnap = volumesnapshot(csivolsnap_name,
+                                csivolsnap_namespace,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;volumeSnapshotContentName&#34;,
+                                volsnapcontent[&#34;metadata&#34;][&#34;name&#34;])
+
+    return csivolsnap, csivolsnap_name</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.prepare_test_csi_snapshot"><code class="name flex">
+<span>def <span class="ident">prepare_test_csi_snapshot</span></span>(<span>apps_api, client, make_deployment_with_pvc, volumesnapshotclass, core_api)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Context:</p>
+<p>After deploy the CSI snapshot CRDs, Controller at
+<https://longhorn.io/docs/\<longhorn> version>/snapshots-and-backups/
+csi-snapshot-support/enable-csi-snapshot-support/</p>
+<p>Create VolumeSnapshotClass with type=snap
+- longhorn-snapshot (type=snap)
+Create Longhorn volume test-vol
+- Size 5GB
+- Create PV/PVC/Workload for the Longhorn volume
+- Write data into volume
+- Setup backup store</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def prepare_test_csi_snapshot(apps_api, # NOQA
+                              client, # NOQA
+                              make_deployment_with_pvc, # NOQA
+                              volumesnapshotclass, # NOQA
+                              core_api, # NOQA
+                              ): # NOQA
+    &#34;&#34;&#34;
+    Context:
+
+    After deploy the CSI snapshot CRDs, Controller at
+    https://longhorn.io/docs/&lt;longhorn version&gt;/snapshots-and-backups/
+    csi-snapshot-support/enable-csi-snapshot-support/
+
+    Create VolumeSnapshotClass with type=snap
+      - longhorn-snapshot (type=snap)
+    Create Longhorn volume test-vol
+      - Size 5GB
+      - Create PV/PVC/Workload for the Longhorn volume
+      - Write data into volume
+      - Setup backup store
+    &#34;&#34;&#34;
+    csi_snapshot_type = &#34;snap&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=&#34;snapshotclass-snap&#34;,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    vol = common.create_and_check_volume(client, generate_volume_name(),
+                                         size=str(500 * Mi))
+
+    pv_name = vol.name + &#34;-pv&#34;
+    common.create_pv_for_volume(client, core_api, vol, pv_name)
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    common.create_pvc_for_volume(client, core_api, vol, pvc_name)
+
+    deployment_name = vol.name + &#34;-dep&#34;
+    deployment = make_deployment_with_pvc(deployment_name, pvc_name)
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=deployment, namespace=&#39;default&#39;)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api, deployment_name)
+    common.write_pod_volume_random_data(core_api, pod.metadata.name,
+                                        data_path, common.DATA_SIZE_IN_MB_2)
+    expected_md5sum = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                          data_path)
+
+    return vol, deployment, csisnapclass, expected_md5sum</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.restore_csi_volume_snapshot"><code class="name flex">
+<span>def <span class="ident">restore_csi_volume_snapshot</span></span>(<span>core_api, client, csivolsnap, pvc_name, pvc_request_storage_size, wait_for_restore=True)</span>
+</code></dt>
+<dd>
+<div class="desc"></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def restore_csi_volume_snapshot(core_api, client, csivolsnap, pvc_name, pvc_request_storage_size, wait_for_restore=True): # NOQA
     restore_pvc = {
         &#39;apiVersion&#39;: &#39;v1&#39;,
         &#39;kind&#39;: &#39;PersistentVolumeClaim&#39;,
@@ -912,10 +1962,583 @@ def test_csi_snapshot_with_invalid_param(
 
     assert restore_volume_name is not None
 
-    wait_for_volume_restoration_completed(client, restore_volume_name)
+    if wait_for_restore is True:
+        wait_for_volume_restoration_completed(client, restore_volume_name)
     wait_for_volume_detached(client, restore_volume_name)
 
     return restore_pvc</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_snapshot_snap_create_csi_snapshot"><code class="name flex">
+<span>def <span class="ident">test_csi_snapshot_snap_create_csi_snapshot</span></span>(<span>apps_api, client, make_deployment_with_pvc, volume_name, volumesnapshotclass, volumesnapshot, csi_pv, pvc, core_api, pod_make)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Context:</p>
+<p>After deploy the CSI snapshot CRDs, Controller at
+<a href="https://longhorn.io/docs/1.4.2/snapshots-and-backups/">https://longhorn.io/docs/1.4.2/snapshots-and-backups/</a>
+csi-snapshot-support/enable-csi-snapshot-support/</p>
+<p>Create VolumeSnapshotClass with type=snap
+- longhorn-snapshot (type=snap)</p>
+<p>Test the extend CSI snapshot type=snap support to Longhorn snapshot</p>
+<p>Steps:</p>
+<ol>
+<li>Create Longhorn volume test-vol<ul>
+<li>Size 5GB</li>
+<li>Create PV/PVC/Workload for the Longhorn volume</li>
+<li>Write data into volume</li>
+<li>Setup backup store</li>
+</ul>
+</li>
+<li>Test create CSI snapshot<ul>
+<li>Volume is in detached state<ul>
+<li>Scale down the workload</li>
+<li>Create VolumeSnapshot with class longhorn-snap</li>
+<li>Verify that the volumesnapshot object is ready</li>
+</ul>
+</li>
+<li>Volume is in attached state<ul>
+<li>Scale up the workload</li>
+<li>Verify the Longhorn snapshot generated</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_csi_snapshot_snap_create_csi_snapshot(apps_api, # NOQA
+                                      client, # NOQA
+                                      make_deployment_with_pvc, # NOQA
+                                      volume_name, # NOQA
+                                      volumesnapshotclass, # NOQA
+                                      volumesnapshot, # NOQA
+                                      csi_pv, # NOQA
+                                      pvc, # NOQA
+                                      core_api, # NOQA
+                                      pod_make): # NOQA
+    &#34;&#34;&#34;
+    Context:
+
+    After deploy the CSI snapshot CRDs, Controller at
+    https://longhorn.io/docs/1.4.2/snapshots-and-backups/
+    csi-snapshot-support/enable-csi-snapshot-support/
+
+    Create VolumeSnapshotClass with type=snap
+      - longhorn-snapshot (type=snap)
+
+    Test the extend CSI snapshot type=snap support to Longhorn snapshot
+
+    Steps:
+
+    0. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+    1. Test create CSI snapshot
+        - Volume is in detached state
+            - Scale down the workload
+            - Create VolumeSnapshot with class longhorn-snap
+            - Verify that the volumesnapshot object is ready
+        - Volume is in attached state
+            - Scale up the workload
+            - Verify the Longhorn snapshot generated
+    &#34;&#34;&#34;
+    # Step 0
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(
+                                  apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api # NOQA
+                                )
+
+    # Step 1 Test create CSI snapshot
+    # Volume is in detached state
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    vol = common.wait_for_volume_detached(client, vol.name)
+
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    # Volume is in attached state
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    vol = common.wait_for_volume_attached(client, vol.name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_snapshot_snap_create_volume_from_snapshot"><code class="name flex">
+<span>def <span class="ident">test_csi_snapshot_snap_create_volume_from_snapshot</span></span>(<span>apps_api, client, make_deployment_with_pvc, volume_name, volumesnapshotclass, volumesnapshot, csi_pv, pvc, core_api, pod_make)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Context:</p>
+<p>After deploy the CSI snapshot CRDs, Controller at
+<a href="https://longhorn.io/docs/1.4.2/snapshots-and-backups/">https://longhorn.io/docs/1.4.2/snapshots-and-backups/</a>
+csi-snapshot-support/enable-csi-snapshot-support/</p>
+<p>Create VolumeSnapshotClass with type=snap
+- longhorn-snapshot (type=snap)</p>
+<p>Test the extend CSI snapshot type=snap support to Longhorn snapshot</p>
+<p>Steps:</p>
+<ol>
+<li>
+<p>Create Longhorn volume test-vol</p>
+<ul>
+<li>Size 5GB</li>
+<li>Create PV/PVC/Workload for the Longhorn volume</li>
+<li>Write data into volume</li>
+<li>Setup backup store</li>
+</ul>
+</li>
+<li>
+<p>Test create new volume from CSI snapshot</p>
+<ul>
+<li>Create VolumeSnapshot with class longhorn-snap</li>
+<li>Create volume from longhorn-snapshot<ul>
+<li>Source volume is attached &amp;&amp; Longhorn snapshot exist<ul>
+<li>Create PVC from snapshot generated from step 1</li>
+<li>Attach the PVC and verify data</li>
+</ul>
+</li>
+<li>Source volume is detached<ul>
+<li>Scale down the workload</li>
+<li>Create PVC from VolumeSnapshot generated from step beggining</li>
+<li>Verify PVC provision failed</li>
+<li>Scale up the workload</li>
+<li>Wait for PVC to finish provisioning and be bounded</li>
+<li>Attach the PVC test-restore-pvc and verify the data</li>
+</ul>
+</li>
+<li>Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist<ul>
+<li>Use VolumeSnapshotContent.snapshotHandle to
+specify Longhorn snapshot generated in step beggining</li>
+<li>Delete the Longhorn snapshot</li>
+<li>Create PVC from VolumeSnapshot generated from step beggining</li>
+<li>PVC should be stuck in provisioning state</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_csi_snapshot_snap_create_volume_from_snapshot(apps_api, # NOQA
+                                      client, # NOQA
+                                      make_deployment_with_pvc, # NOQA
+                                      volume_name, # NOQA
+                                      volumesnapshotclass, # NOQA
+                                      volumesnapshot, # NOQA
+                                      csi_pv, # NOQA
+                                      pvc, # NOQA
+                                      core_api, # NOQA
+                                      pod_make): # NOQA
+    &#34;&#34;&#34;
+    Context:
+
+    After deploy the CSI snapshot CRDs, Controller at
+    https://longhorn.io/docs/1.4.2/snapshots-and-backups/
+    csi-snapshot-support/enable-csi-snapshot-support/
+
+    Create VolumeSnapshotClass with type=snap
+      - longhorn-snapshot (type=snap)
+
+    Test the extend CSI snapshot type=snap support to Longhorn snapshot
+
+    Steps:
+
+    0. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+
+    1. Test create new volume from CSI snapshot
+        - Create VolumeSnapshot with class longhorn-snap
+        - Create volume from longhorn-snapshot
+            - Source volume is attached &amp;&amp; Longhorn snapshot exist
+                - Create PVC from snapshot generated from step 1
+                - Attach the PVC and verify data
+            - Source volume is detached
+                - Scale down the workload
+                - Create PVC from VolumeSnapshot generated from step beggining
+                - Verify PVC provision failed
+                - Scale up the workload
+                - Wait for PVC to finish provisioning and be bounded
+                - Attach the PVC test-restore-pvc and verify the data
+            - Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
+                - Use VolumeSnapshotContent.snapshotHandle to
+                  specify Longhorn snapshot generated in step beggining
+                - Delete the Longhorn snapshot
+                - Create PVC from VolumeSnapshot generated from step beggining
+                - PVC should be stuck in provisioning state
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(
+                                  apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api # NOQA
+                                 )
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    # Step 1 Test create new volume from CSI snapshot
+    # Source volume is attached &amp;&amp; Longhorn snapshot exist
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#39;longhorn&#39;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    pv_name = wait_and_get_pv_for_pvc(core_api,
+                                      pvc[&#39;metadata&#39;][&#39;name&#39;]).metadata.name
+    new_deployment_name = pv_name + &#34;-dep&#34;
+    new_deployment = make_deployment_with_pvc(new_deployment_name,
+                                              pvc[&#39;metadata&#39;][&#39;name&#39;])
+    new_deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=new_deployment,
+                                          namespace=&#39;default&#39;)
+
+    common.wait_for_volume_status(client, pv_name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api, new_deployment_name)
+    created_md5sum = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                         data_path)
+
+    assert expected_md5sum == created_md5sum
+
+    # Source volume is detached
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_DETACHED)
+
+    new_pvc1 = pvc
+    new_pvc1[&#39;metadata&#39;][&#39;name&#39;] = pvc[&#39;metadata&#39;][&#39;name&#39;] + &#34;new-pvc1&#34;
+    create_pvc(new_pvc1)
+
+    wait_for_pvc_phase(core_api, new_pvc1[&#39;metadata&#39;][&#39;name&#39;], &#34;Bound&#34;)
+    pv_name_2 = \
+        wait_and_get_pv_for_pvc(core_api,
+                                new_pvc1[&#39;metadata&#39;][&#39;name&#39;]).metadata.name
+
+    new_deployment_name_2 = pv_name_2 + &#34;-dep-2&#34;
+    new_deployment_2 = make_deployment_with_pvc(new_deployment_name_2,
+                                                new_pvc1[&#39;metadata&#39;][&#39;name&#39;])
+    new_deployment_2[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.create_namespaced_deployment(body=new_deployment_2,
+                                          namespace=&#39;default&#39;)
+
+    common.wait_for_volume_status(client, pv_name_2,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    data_path = &#34;/data/test&#34;
+    pod = common.wait_and_get_any_deployment_pod(core_api,
+                                                 new_deployment_name_2)
+    created_md5sum_2 = get_pod_data_md5sum(core_api, pod.metadata.name,
+                                           data_path)
+
+    assert expected_md5sum == created_md5sum_2
+
+    # Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
+    deployment[&#34;spec&#34;][&#34;replicas&#34;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    common.wait_for_volume_status(client, vol.name,
+                                  common.VOLUME_FIELD_STATE,
+                                  common.VOLUME_STATE_ATTACHED)
+    vol = client.by_id_volume(vol.name)
+    # create new snapshot to avoid the case the volume only has 1
+    # snapshot so the snapshot can not deleted
+    vol.snapshotCreate()
+    snapshot_content = get_volumesnapshotcontent(csivolsnap[&#34;metadata&#34;][&#34;uid&#34;])
+    snap_name = snapshot_content[&#34;status&#34;][&#34;snapshotHandle&#34;]
+
+    snapshots = vol.snapshotList()
+    for item in snapshots:
+        if item.name in snap_name:
+            vol.snapshotDelete(name=item.name)
+    vol.snapshotPurge()
+
+    new_pvc2 = pvc
+    new_pvc2[&#39;metadata&#39;][&#39;name&#39;] = pvc[&#39;metadata&#39;][&#39;name&#39;] + &#34;new-pvc2&#34;
+    create_pvc(new_pvc2)
+    check_pvc_in_specific_status(core_api,
+                                 new_pvc2[&#39;metadata&#39;][&#39;name&#39;], &#34;Pending&#34;)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist"><code class="name flex">
+<span>def <span class="ident">test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist</span></span>(<span>apps_api, client, make_deployment_with_pvc, volumesnapshotclass, volumesnapshot, core_api)</span>
+</code></dt>
+<dd>
+<div class="desc"><ol>
+<li>Create volumesnapshotclass with type=snap</li>
+<li>Create Longhorn volume test-vol<ul>
+<li>Size 5GB</li>
+<li>Create PV/PVC/Workload for the Longhorn volume</li>
+<li>Write data into volume</li>
+<li>Setup backup store</li>
+<li>Create volumeSnapshot by volumesnapshotclass in step 1</li>
+</ul>
+</li>
+<li>Test delete CSI snapshot : Type is snap<ul>
+<li>volume is attached &amp;&amp; snapshot exist<ul>
+<li>Verify the creation of Longhorn snapshot with the name in
+the field VolumeSnapshotContent.snapshotHandle</li>
+<li>Delete the VolumeSnapshot</li>
+<li>Verify that Longhorn snapshot is removed or marked as removed</li>
+<li>Verify that the VolumeSnapshot is deleted.</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist(apps_api, # NOQA
+                                                              client, # NOQA
+                                                              make_deployment_with_pvc, # NOQA
+                                                              volumesnapshotclass, # NOQA
+                                                              volumesnapshot, # NOQA
+                                                              core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is attached &amp;&amp; snapshot exist
+            - Verify the creation of Longhorn snapshot with the name in
+                the field VolumeSnapshotContent.snapshotHandle
+            - Delete the VolumeSnapshot
+            - Verify that Longhorn snapshot is removed or marked as removed
+            - Verify that the VolumeSnapshot is deleted.
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist"><code class="name flex">
+<span>def <span class="ident">test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist</span></span>(<span>apps_api, client, make_deployment_with_pvc, volumesnapshotclass, volumesnapshot, core_api)</span>
+</code></dt>
+<dd>
+<div class="desc"><ol>
+<li>Create volumesnapshotclass with type=snap</li>
+<li>Create Longhorn volume test-vol<ul>
+<li>Size 5GB</li>
+<li>Create PV/PVC/Workload for the Longhorn volume</li>
+<li>Write data into volume</li>
+<li>Setup backup store</li>
+<li>Create volumeSnapshot by volumesnapshotclass in step 1</li>
+</ul>
+</li>
+<li>Test delete CSI snapshot : Type is snap<ul>
+<li>volume is attached &amp;&amp; snapshot doesn’t exist<ul>
+<li>Delete the VolumeSnapshot</li>
+<li>VolumeSnapshot is deleted</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist(apps_api, # NOQA
+                                                                  client, # NOQA
+                                                                  make_deployment_with_pvc, # NOQA
+                                                                  volumesnapshotclass, # NOQA
+                                                                  volumesnapshot, # NOQA
+                                                                  core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is attached &amp;&amp; snapshot doesn’t exist
+            - Delete the VolumeSnapshot
+            - VolumeSnapshot is deleted
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    wait_for_volumesnapshot_ready(
+                            volumesnapshot_name=csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                            namespace=&#39;default&#39;,
+                            ready_to_use=True)
+
+    vol = client.by_id_volume(vol.name)
+    snapshots = vol.snapshotList()
+    vol.snapshotDelete(name=snapshots[0].name)
+    vol.snapshotPurge()
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_volume_detached"><code class="name flex">
+<span>def <span class="ident">test_csi_snapshot_snap_delete_csi_snapshot_volume_detached</span></span>(<span>apps_api, client, make_deployment_with_pvc, volumesnapshotclass, volumesnapshot, core_api)</span>
+</code></dt>
+<dd>
+<div class="desc"><ol>
+<li>Create volumesnapshotclass with type=snap</li>
+<li>Create Longhorn volume test-vol<ul>
+<li>Size 5GB</li>
+<li>Create PV/PVC/Workload for the Longhorn volume</li>
+<li>Write data into volume</li>
+<li>Setup backup store</li>
+<li>Create volumeSnapshot by volumesnapshotclass in step 1</li>
+</ul>
+</li>
+<li>Test delete CSI snapshot : Type is snap<ul>
+<li>volume is detached<ul>
+<li>Delete the VolumeSnapshot</li>
+<li>Verify that VolumeSnapshot is stuck in deleting</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_csi_snapshot_snap_delete_csi_snapshot_volume_detached(apps_api, # NOQA
+                                                               client, # NOQA
+                                                               make_deployment_with_pvc, # NOQA
+                                                               volumesnapshotclass, # NOQA
+                                                               volumesnapshot, # NOQA
+                                                               core_api): # NOQA
+    &#34;&#34;&#34;
+    1. Create volumesnapshotclass with type=snap
+    2. Create Longhorn volume test-vol
+        - Size 5GB
+        - Create PV/PVC/Workload for the Longhorn volume
+        - Write data into volume
+        - Setup backup store
+        - Create volumeSnapshot by volumesnapshotclass in step 1
+    3. Test delete CSI snapshot : Type is snap
+        - volume is detached
+            - Delete the VolumeSnapshot
+            - Verify that VolumeSnapshot is stuck in deleting
+    &#34;&#34;&#34;
+    vol, deployment, csisnapclass, expected_md5sum = \
+        prepare_test_csi_snapshot(apps_api, # NOQA
+                                  client, # NOQA
+                                  make_deployment_with_pvc, # NOQA
+                                  volumesnapshotclass, # NOQA
+                                  core_api) # NOQA
+
+    pvc_name = vol.name + &#34;-pvc&#34;
+    deployment_name = deployment[&#39;metadata&#39;][&#39;name&#39;]
+    csivolsnap = volumesnapshot(vol.name + &#34;-volumesnapshot-3&#34;,
+                                &#34;default&#34;,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment_name)
+    wait_for_volume_detached(client, vol.name)
+
+    delete_volumesnapshot(csivolsnap[&#34;metadata&#34;][&#34;name&#34;], &#34;default&#34;)
+
+    wait_volumesnapshot_deleted(csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;default&#34;,
+                                can_be_deleted=True)</code></pre>
 </details>
 </dd>
 <dt id="tests.test_csi_snapshotter.test_csi_snapshot_with_bak_param"><code class="name flex">
@@ -1108,155 +2731,232 @@ csi-snapshot-support/enable-csi-snapshot-support/</p>
     request.addfinalizer(finalizer)</code></pre>
 </details>
 </dd>
-<dt id="tests.test_csi_snapshotter.test_csi_snapshot_with_snap_param"><code class="name flex">
-<span>def <span class="ident">test_csi_snapshot_with_snap_param</span></span>(<span>client, volume_name)</span>
+<dt id="tests.test_csi_snapshotter.test_csi_volumesnapshot_backing_image_basic"><code class="name flex">
+<span>def <span class="ident">test_csi_volumesnapshot_backing_image_basic</span></span>(<span>client, core_api, csi_pv, pod_make, pvc, request, volume_name, volumesnapshotclass, volumesnapshot)</span>
 </code></dt>
 <dd>
-<div class="desc"><p>Context:</p>
-<p>After deploy the CSI snapshot CRDs, Controller at
-<a href="https://longhorn.io/docs/1.2.3/snapshots-and-backups/">https://longhorn.io/docs/1.2.3/snapshots-and-backups/</a>
-csi-snapshot-support/enable-csi-snapshot-support/</p>
-<p>Create VolumeSnapshotClass with type=snap
-- longhorn-snapshot (type=snap)</p>
-<p>Test the extend CSI snapshot type=snap support to Longhorn snapshot</p>
-<p>Steps:</p>
-<ol>
-<li>Create Longhorn volume test-vol<ul>
-<li>Size 5GB</li>
-<li>Create PV/PVC/Workload for the Longhorn volume</li>
-<li>Write data into volume</li>
-<li>Setup backup store</li>
-</ul>
-</li>
-<li>Test create CSI snapshot<ul>
-<li>Volume is in detached state<ul>
-<li>Scale down the workload</li>
-<li>Create VolumeSnapshot with class longhorn-snap</li>
-<li>Verify that the volumesnapshot object is not ready</li>
-</ul>
-</li>
-<li>Volume is in attached state<ul>
-<li>Scale up the workload</li>
-<li>Verify the Longhorn snapshot generated</li>
-</ul>
-</li>
-</ul>
-</li>
-<li>Test create new volume from CSI snapshot<ul>
-<li>Create volume from longhorn-snapshot<ul>
-<li>Source volume is attached &amp;&amp; Longhorn snapshot exist<ul>
-<li>Create PVC from snapshot generated from step 1</li>
-<li>Attach the PVC and verify data</li>
-</ul>
-</li>
-<li>Source volume is detached<ul>
-<li>Scale down the workload</li>
-<li>Create PVC from VolumeSnapshot generated from step 1</li>
-<li>Verify PVC provision failed</li>
-</ul>
-</li>
-<li>Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist<ul>
-<li>Scale up the workload</li>
-<li>Use VolumeSnapshotContent.snapshotHandle to
-specify Longhorn snapshot generated in step 1</li>
-<li>Delete the Longhorn snapshot</li>
-<li>Create PVC from VolumeSnapshot generated from step 1</li>
-<li>PVC should be stuck in provisioning state</li>
-</ul>
-</li>
-</ul>
-</li>
-</ul>
-</li>
-<li>Test delete CSI snapshot<ul>
-<li>Type is snap<ul>
-<li>volume is attached &amp;&amp; snapshot doesn’t exist<ul>
-<li>Delete the VolumeSnapshot</li>
-<li>VolumeSnapshot is deleted</li>
-</ul>
-</li>
-<li>volume is attached &amp;&amp; snapshot exist<ul>
-<li>Verify the creation of Longhorn snapshot with the name in
-the field VolumeSnapshotContent.snapshotHandle</li>
-<li>Delete the VolumeSnapshot</li>
-<li>Verify that Longhorn snapshot is removed or marked as removed</li>
-<li>Verify that the VolumeSnapshot is deleted.</li>
-</ul>
-</li>
-<li>volume is detached<ul>
-<li>Delete the VolumeSnapshot</li>
-<li>Verify that VolumeSnapshot is stuck in deleting</li>
-</ul>
-</li>
-</ul>
-</li>
-</ul>
-</li>
-</ol></div>
+<div class="desc"><p>Test Create/Delete BackingImage using VolumeSnapshot with a given Volume</p>
+<p>Setup
+- Create a VolumeSnapshotClass with type <code>bi</code>
+<code>kind: VolumeSnapshotClass
+apiVersion: snapshot.storage.k8s.io/v1
+metadata:
+name: longhorn-snapshot-vsc
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters:
+type: bi</code></p>
+<p>Given
+- The Volume attached to a workload, having data and computed md5sum.</p>
+<p>When
+- Creating the VolumeSnapshot
+<code>apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+name: test-snapshot-backing
+spec:
+volumeSnapshotClassName: longhorn-snapshot-vsc
+source:
+persistentVolumeClaimName: test-vol</code></p>
+<p>Then
+- A BackingImage is created with the following properties
+<code>apiVersion: longhorn.io/v1beta2
+kind: BackingImage
+metadata:
+name: `snapshot-${VolumeSnapshot.uuid}`
+namespace: longhorn-system
+spec:
+sourceType: export-from-volume
+sourceParameters:
+volume-name: test-vol
+export-type: raw</code></p>
+<p>When
+- Creating a PVC with dataSource pointing to the VolumeSnapshot
+<code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+name: test-restore-pvc
+spec:
+storageClassName: longhorn
+dataSource:
+name: test-snapshot-backing
+kind: VolumeSnapshot
+apiGroup: snapshot.storage.k8s.io
+accessModes:
+- ReadWriteOnce
+resources:
+requests:
+storage: 5Gi</code></p>
+<p>Then
+- A Volume is created using BackingImage snapshot-${VolumeSnapshot.uuid}
+- Verifying the data and md5sum in the new Volume</p>
+<p>When
+- Delete the new Volume from the the VolumeSnapshot
+- Delete the VolumeSnapshot
+<code>&gt; kubectl delete vs/test-snapshot-backing</code></p>
+<p>Then
+- The BackingImage is deleted as well</p></div>
 <details class="source">
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">@pytest.mark.skip(reason=&#34;TODO&#34;) # NOQA
-def test_csi_snapshot_with_snap_param(client, volume_name): # NOQA
+<pre><code class="python">def test_csi_volumesnapshot_backing_image_basic(client, # NOQA
+                                                core_api, # NOQA
+                                                csi_pv, # NOQA
+                                                pod_make, # NOQA
+                                                pvc, # NOQA
+                                                request, # NOQA
+                                                volume_name, # NOQA
+                                                volumesnapshotclass, # NOQA
+                                                volumesnapshot): # NOQA
     &#34;&#34;&#34;
-    Context:
+    Test Create/Delete BackingImage using VolumeSnapshot with a given Volume
 
-    After deploy the CSI snapshot CRDs, Controller at
-    https://longhorn.io/docs/1.2.3/snapshots-and-backups/
-    csi-snapshot-support/enable-csi-snapshot-support/
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
 
-    Create VolumeSnapshotClass with type=snap
-      - longhorn-snapshot (type=snap)
+    Given
+    - The Volume attached to a workload, having data and computed md5sum.
 
-    Test the extend CSI snapshot type=snap support to Longhorn snapshot
+    When
+    - Creating the VolumeSnapshot
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                persistentVolumeClaimName: test-vol
+        ```
 
-    Steps:
+    Then
+    - A BackingImage is created with the following properties
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: `snapshot-${VolumeSnapshot.uuid}`
+            namespace: longhorn-system
+        spec:
+            sourceType: export-from-volume
+            sourceParameters:
+                volume-name: test-vol
+                export-type: raw
+        ```
 
-    0. Create Longhorn volume test-vol
-        - Size 5GB
-        - Create PV/PVC/Workload for the Longhorn volume
-        - Write data into volume
-        - Setup backup store
-    1. Test create CSI snapshot
-        - Volume is in detached state
-            - Scale down the workload
-            - Create VolumeSnapshot with class longhorn-snap
-            - Verify that the volumesnapshot object is not ready
-        - Volume is in attached state
-            - Scale up the workload
-            - Verify the Longhorn snapshot generated
-    2. Test create new volume from CSI snapshot
-        - Create volume from longhorn-snapshot
-            - Source volume is attached &amp;&amp; Longhorn snapshot exist
-                - Create PVC from snapshot generated from step 1
-                - Attach the PVC and verify data
-            - Source volume is detached
-                - Scale down the workload
-                - Create PVC from VolumeSnapshot generated from step 1
-                - Verify PVC provision failed
-            - Source volume is attached &amp;&amp; Longhorn snapshot doesn’t exist
-                - Scale up the workload
-                - Use VolumeSnapshotContent.snapshotHandle to
-                  specify Longhorn snapshot generated in step 1
-                - Delete the Longhorn snapshot
-                - Create PVC from VolumeSnapshot generated from step 1
-                - PVC should be stuck in provisioning state
-    3. Test delete CSI snapshot
-        - Type is snap
-            - volume is attached &amp;&amp; snapshot doesn’t exist
-                - Delete the VolumeSnapshot
-                - VolumeSnapshot is deleted
-            - volume is attached &amp;&amp; snapshot exist
-                - Verify the creation of Longhorn snapshot with the name in
-                  the field VolumeSnapshotContent.snapshotHandle
-                - Delete the VolumeSnapshot
-                - Verify that Longhorn snapshot is removed or marked as removed
-                - Verify that the VolumeSnapshot is deleted.
-            - volume is detached
-                - Delete the VolumeSnapshot
-                - Verify that VolumeSnapshot is stuck in deleting
-    &#34;&#34;&#34;</code></pre>
+    When
+    - Creating a PVC with dataSource pointing to the VolumeSnapshot
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-pvc
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                storage: 5Gi
+        ```
+
+    Then
+    - A Volume is created using BackingImage snapshot-${VolumeSnapshot.uuid}
+    - Verifying the data and md5sum in the new Volume
+
+    When
+    - Delete the new Volume from the the VolumeSnapshot
+    - Delete the VolumeSnapshot
+        ```
+        &gt; kubectl delete vs/test-snapshot-backing
+        ```
+
+    Then
+    - The BackingImage is deleted as well
+    &#34;&#34;&#34;
+    csi_snapshot_type = &#34;bi&#34;
+    storage_class_name = &#34;longhorn-snapshot-vsc&#34;
+    csisnapclass = \
+        volumesnapshotclass(name=storage_class_name,
+                            deletepolicy=&#34;Delete&#34;,
+                            snapshot_type=csi_snapshot_type)
+
+    pod_name, pv_name, pvc_name, md5sum = \
+        prepare_pod_with_data_in_mb(client, core_api,
+                                    csi_pv, pvc, pod_make,
+                                    volume_name,
+                                    data_path=&#34;/data/test&#34;)
+
+    csivolsnap_name = &#34;test-snapshot-backing&#34;
+    csivolsnap_namespace = &#34;default&#34;
+    csivolsnap = volumesnapshot(csivolsnap_name,
+                                csivolsnap_namespace,
+                                csisnapclass[&#34;metadata&#34;][&#34;name&#34;],
+                                &#34;persistentVolumeClaimName&#34;,
+                                pvc_name)
+
+    backing_images = client.list_backing_image()
+    assert len(backing_images) == 1
+    wait_for_backing_image_status(client, backing_images[0].name,
+                                  BACKING_IMAGE_STATE_READY)
+    assert backing_images[0].sourceType == BACKING_IMAGE_SOURCE_TYPE_FROM_VOLUME # NOQA
+    assert backing_images[0].parameters[&#34;volume-name&#34;] == pv_name
+    assert not backing_images[0].deletionTimestamp
+    assert len(backing_images[0].diskFileStatusMap) == 1
+
+    restore_pvc_name = &#34;test-restore-pvc&#34;
+    restore_pvc_size = pvc[&#34;spec&#34;][&#34;resources&#34;][&#34;requests&#34;][&#34;storage&#34;]
+    restore_csi_volume_snapshot(core_api,
+                                client,
+                                csivolsnap,
+                                restore_pvc_name,
+                                restore_pvc_size,
+                                wait_for_restore=False)
+
+    restore_pod = pod_make()
+    restore_pod_name = restore_pod[&#34;metadata&#34;][&#34;name&#34;]
+    restore_pod[&#39;spec&#39;][&#39;volumes&#39;] = [create_pvc_spec(restore_pvc_name)]
+
+    create_and_wait_pod(core_api, restore_pod)
+    restore_md5sum = \
+        get_pod_data_md5sum(core_api, restore_pod_name, path=&#34;/data/test&#34;)
+    assert restore_md5sum == md5sum
+
+    &#34;&#34;&#34;
+    Delete volumesnapshot will also delete correspond backing image.
+    The deletion will stuck if backing images in use.
+
+    Add finalizer make backing image not in use before delete volumesnapshot.
+
+    https://github.com/longhorn/longhorn/issues/6266#issuecomment-1628474916
+    &#34;&#34;&#34;
+    def finalizer():
+        delete_and_wait_pod(core_api, pod_name)
+        delete_and_wait_pvc(core_api, pvc_name)
+        delete_and_wait_pod(core_api, restore_pod_name)
+        delete_and_wait_pvc(core_api, restore_pvc_name)
+        delete_volumesnapshot(csivolsnap_name, &#34;default&#34;)
+        wait_volumesnapshot_deleted(csivolsnap_name,
+                                    &#34;default&#34;,
+                                    retry_counts=RETRY_COUNTS_SHORT)
+
+    request.addfinalizer(finalizer)</code></pre>
 </details>
 </dd>
 <dt id="tests.test_csi_snapshotter.test_csi_volumesnapshot_basic"><code class="name flex">
@@ -1585,6 +3285,415 @@ def test_csi_volumesnapshot_restore_existing_backup(set_random_backupstore, # NO
         wait_for_backup_delete(client, volume_name, b[&#34;name&#34;])</code></pre>
 </details>
 </dd>
+<dt id="tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_on_demand_backing_image"><code class="name flex">
+<span>def <span class="ident">test_csi_volumesnapshot_restore_on_demand_backing_image</span></span>(<span>bi_url, bi_checksum, client, core_api, pod_make, pvc, request, volumesnapshotclass, volumesnapshotcontent, volumesnapshot)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Test Restore Volume from CSI VolumeSnapshot with on-demand BackingImage</p>
+<p>Setup
+- Create a VolumeSnapshotClass with type <code>bi</code>
+<code>kind: VolumeSnapshotClass
+apiVersion: snapshot.storage.k8s.io/v1
+metadata:
+name: longhorn-snapshot-vsc
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters:
+type: bi</code></p>
+<p>Given
+- Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage
+# NOQA
+- (snapshotHandle was dynamic with 2 different of backing images in test script)
+<code>apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotContent
+metadata:
+name: test-on-demand-backing
+spec:
+volumeSnapshotClassName: longhorn-snapshot-vsc
+driver: driver.longhorn.io
+deletionPolicy: Delete
+source:
+snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b
+# NOQA
+volumeSnapshotRef:
+name: test-snapshot-on-demand-backing
+namespace: default</code></p>
+<pre><code>```
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+    name: test-snapshot-on-demand-backing
+spec:
+    volumeSnapshotClassName: longhorn-snapshot-vsc
+    source:
+        volumeSnapshotContentName: test-on-demand-backing
+```
+</code></pre>
+<p>When
+- Creating the PVC
+<code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+name: test-restore-on-demand-backing
+spec:
+storageClassName: longhorn
+dataSource:
+name: test-snapshot-on-demand-backing
+kind: VolumeSnapshot
+apiGroup: snapshot.storage.k8s.io
+accessModes:
+- ReadWriteOnce
+resources:
+requests:
+storage: 5Gi</code>
+Then
+- A BackingImage is created (sourceParameters was dynamic in test script)
+<code>apiVersion: longhorn.io/v1beta2
+kind: BackingImage
+metadata:
+name: test-bi
+namespace: longhorn-system
+spec:
+sourceType: download
+sourceParameters:
+url: &lt;https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2&gt;
+# NOQA
+checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b
+# NOQA</code>
+- A Volume is created using the BackingImage <code>test-bi</code>
+- Verify the data (Directories of the backing images) exists in the mount point.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">@pytest.mark.parametrize(&#34;bi_url, bi_checksum&#34;, [(BACKING_IMAGE_QCOW2_URL, BACKING_IMAGE_QCOW2_CHECKSUM), (BACKING_IMAGE_RAW_URL, BACKING_IMAGE_RAW_CHECKSUM)]) # NOQA
+def test_csi_volumesnapshot_restore_on_demand_backing_image(bi_url, # NOQA
+                                                            bi_checksum, # NOQA
+                                                            client, # NOQA
+                                                            core_api, # NOQA
+                                                            pod_make, # NOQA
+                                                            pvc, # NOQA
+                                                            request, # NOQA
+                                                            volumesnapshotclass, # NOQA
+                                                            volumesnapshotcontent, # NOQA
+                                                            volumesnapshot): # NOQA
+    &#34;&#34;&#34;
+    Test Restore Volume from CSI VolumeSnapshot with on-demand BackingImage
+
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
+
+    Given
+    - Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage  # NOQA
+      - (snapshotHandle was dynamic with 2 different of backing images in test script)
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotContent
+        metadata:
+            name: test-on-demand-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            driver: driver.longhorn.io
+            deletionPolicy: Delete
+            source:
+                snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+            volumeSnapshotRef:
+                name: test-snapshot-on-demand-backing
+                namespace: default
+        ```
+
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-on-demand-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                volumeSnapshotContentName: test-on-demand-backing
+        ```
+    When
+    - Creating the PVC
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-on-demand-backing
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-on-demand-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                    storage: 5Gi
+        ```
+    Then
+    - A BackingImage is created (sourceParameters was dynamic in test script)
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: test-bi
+            namespace: longhorn-system
+        spec:
+            sourceType: download
+            sourceParameters:
+                url: https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2  # NOQA
+            checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+        ```
+    - A Volume is created using the BackingImage `test-bi`
+    - Verify the data (Directories of the backing images) exists in the mount point.
+    &#34;&#34;&#34;
+    csivolsnap, csivolsnap_name = prepare_bi_type_test(bi_checksum,
+                                                       bi_url,
+                                                       volumesnapshotclass,
+                                                       volumesnapshotcontent,
+                                                       volumesnapshot)
+
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#34;longhorn&#34;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    for i in range(RETRY_COUNTS_SHORT):
+        try:
+            client.by_id_backing_image(BACKING_IMAGE_NAME)
+        except Exception as err:
+            print(err)
+            time.sleep(RETRY_INTERVAL)
+
+    wait_for_backing_image_status(client, BACKING_IMAGE_NAME,
+                                  BACKING_IMAGE_STATE_READY)
+
+    backing_image = client.by_id_backing_image(BACKING_IMAGE_NAME)
+    assert backing_image.sourceType == BACKING_IMAGE_SOURCE_TYPE_DOWNLOAD
+    assert backing_image.parameters[&#34;url&#34;] == bi_url
+    assert backing_image.currentChecksum == bi_checksum
+    assert not backing_image.deletionTimestamp
+    assert len(backing_image.diskFileStatusMap) == 1
+
+    create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api,
+                                                              csivolsnap_name,
+                                                              pod_make,
+                                                              pvc,
+                                                              request)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_pre_provision_backing_image"><code class="name flex">
+<span>def <span class="ident">test_csi_volumesnapshot_restore_pre_provision_backing_image</span></span>(<span>bi_url, bi_checksum, client, core_api, pod_make, pvc, request, volumesnapshotclass, volumesnapshotcontent, volumesnapshot)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Test Restore Volume from CSI VolumeSnapshot with existing BackingImage</p>
+<p>Setup
+- Create a VolumeSnapshotClass with type <code>bi</code>
+<code>kind: VolumeSnapshotClass
+apiVersion: snapshot.storage.k8s.io/v1
+metadata:
+name: longhorn-snapshot-vsc
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters:
+type: bi</code></p>
+<p>Given
+- Creating a BackingImage
+<code>apiVersion: longhorn.io/v1beta2
+kind: BackingImage
+metadata:
+name: test-bi
+namespace: longhorn-system
+spec:
+sourceType: download
+sourceParameters:
+url: &lt;https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2&gt;
+# NOQA
+checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b
+# NOQA</code>
+- Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage
+- (snapshotHandle was dynamic with 2 different of backing images in test script)
+<code>apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotContent
+metadata:
+name: test-existing-backing
+spec:
+volumeSnapshotClassName: longhorn-snapshot-vsc
+driver: driver.longhorn.io
+deletionPolicy: Delete
+source:
+snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b
+# NOQA
+volumeSnapshotRef:
+name: test-snapshot-existing-backing
+namespace: default</code></p>
+<pre><code>```
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+    name: test-snapshot-existing-backing
+spec:
+    volumeSnapshotClassName: longhorn-snapshot-vsc
+    source:
+        volumeSnapshotContentName: test-existing-backing
+```
+</code></pre>
+<p>When
+- Creating the PVC
+<code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+name: test-restore-existing-backing
+spec:
+storageClassName: longhorn
+dataSource:
+name: test-snapshot-existing-backing
+kind: VolumeSnapshot
+apiGroup: snapshot.storage.k8s.io
+accessModes:
+- ReadWriteOnce
+resources:
+requests:
+storage: 5Gi</code></p>
+<p>Then
+- A Volume is created using the BackingImage <code>test-bi</code>
+- Verify the data (Directories of the backing images) exists in the mount point.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">@pytest.mark.parametrize(&#34;bi_url, bi_checksum&#34;, [(BACKING_IMAGE_QCOW2_URL, BACKING_IMAGE_QCOW2_CHECKSUM), (BACKING_IMAGE_RAW_URL, BACKING_IMAGE_RAW_CHECKSUM)]) # NOQA
+def test_csi_volumesnapshot_restore_pre_provision_backing_image(bi_url, # NOQA
+                                                                bi_checksum, # NOQA
+                                                                client, # NOQA
+                                                                core_api, # NOQA
+                                                                pod_make, # NOQA
+                                                                pvc, # NOQA
+                                                                request, # NOQA
+                                                                volumesnapshotclass, # NOQA
+                                                                volumesnapshotcontent, # NOQA
+                                                                volumesnapshot): # NOQA
+    &#34;&#34;&#34;
+    Test Restore Volume from CSI VolumeSnapshot with existing BackingImage
+
+    Setup
+    - Create a VolumeSnapshotClass with type `bi`
+        ```
+        kind: VolumeSnapshotClass
+        apiVersion: snapshot.storage.k8s.io/v1
+        metadata:
+            name: longhorn-snapshot-vsc
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+            type: bi
+        ```
+
+    Given
+    - Creating a BackingImage
+        ```
+        apiVersion: longhorn.io/v1beta2
+        kind: BackingImage
+        metadata:
+            name: test-bi
+            namespace: longhorn-system
+        spec:
+            sourceType: download
+            sourceParameters:
+                url: https://longhorn-backing-image.s3-us-west-1.amazonaws.com/parrot.qcow2  # NOQA
+            checksum: bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+        ```
+    - Creating VolumeSnapshotContent and VolumeSnapshot to associate with the BackingImage
+      - (snapshotHandle was dynamic with 2 different of backing images in test script)
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotContent
+        metadata:
+            name: test-existing-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            driver: driver.longhorn.io
+            deletionPolicy: Delete
+            source:
+                snapshotHandle: bi://backing?backingImageDataSourceType=download&amp;backingImage=test-bi&amp;url=https%3A%2F%2Flonghorn-backing-image.s3-us-west-1.amazonaws.com%2Fparrot.qcow2&amp;backingImageChecksum=bd79ab9e6d45abf4f3f0adf552a868074dd235c4698ce7258d521160e0ad79ffe555b94e7d4007add6e1a25f4526885eb25c53ce38f7d344dd4925b9f2cb5d3b  # NOQA
+            volumeSnapshotRef:
+                name: test-snapshot-existing-backing
+                namespace: default
+        ```
+
+        ```
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        metadata:
+            name: test-snapshot-existing-backing
+        spec:
+            volumeSnapshotClassName: longhorn-snapshot-vsc
+            source:
+                volumeSnapshotContentName: test-existing-backing
+        ```
+    When
+    - Creating the PVC
+        ```
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+            name: test-restore-existing-backing
+        spec:
+            storageClassName: longhorn
+            dataSource:
+                name: test-snapshot-existing-backing
+                kind: VolumeSnapshot
+                apiGroup: snapshot.storage.k8s.io
+            accessModes:
+                - ReadWriteOnce
+            resources:
+                requests:
+                    storage: 5Gi
+        ```
+
+    Then
+    - A Volume is created using the BackingImage `test-bi`
+    - Verify the data (Directories of the backing images) exists in the mount point.
+    &#34;&#34;&#34;
+    create_backing_image_with_matching_url(client, BACKING_IMAGE_NAME, bi_url)
+
+    csivolsnap, csivolsnap_name = prepare_bi_type_test(bi_checksum,
+                                                       bi_url,
+                                                       volumesnapshotclass,
+                                                       volumesnapshotcontent,
+                                                       volumesnapshot)
+
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#34;longhorn&#34;
+    pvc[&#39;spec&#39;][&#39;dataSource&#39;] = {
+        &#39;name&#39;: csivolsnap[&#34;metadata&#34;][&#34;name&#34;],
+        &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
+        &#39;apiGroup&#39;: &#39;snapshot.storage.k8s.io&#39;
+    }
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(500 * Mi)
+    create_pvc(pvc)
+
+    create_pod_from_bi_type_volumesnapshot_pvc_and_check_data(core_api,
+                                                              csivolsnap_name,
+                                                              pod_make,
+                                                              pvc,
+                                                              request)</code></pre>
+</details>
+</dd>
 <dt id="tests.test_csi_snapshotter.volumesnapshot"><code class="name flex">
 <span>def <span class="ident">volumesnapshot</span></span>(<span>request)</span>
 </code></dt>
@@ -1606,7 +3715,7 @@ def volumesnapshot(request):
                                   source_type,
                                   source_name):
             manifest = {
-                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1beta1&#39;,
+                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1&#39;,
                 &#39;kind&#39;: &#39;VolumeSnapshot&#39;,
                 &#39;metadata&#39;: {
                   &#39;name&#39;: name,
@@ -1692,7 +3801,7 @@ def volumesnapshotclass(request):
         def create_volumesnapshotclass(name, deletepolicy, snapshot_type=None):
             manifest = {
                 &#39;kind&#39;: &#39;VolumeSnapshotClass&#39;,
-                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1beta1&#39;,
+                &#39;apiVersion&#39;: &#39;snapshot.storage.k8s.io/v1&#39;,
                 &#39;metadata&#39;: {
                   &#39;name&#39;: name
                 },
@@ -1764,7 +3873,7 @@ def volumesnapshotcontent(request):
                                          volumesnapshot_ref_name,
                                          volumesnapshot_ref_namespace):
             manifest = {
-                &#34;apiVersion&#34;: &#34;snapshot.storage.k8s.io/v1beta1&#34;,
+                &#34;apiVersion&#34;: &#34;snapshot.storage.k8s.io/v1&#34;,
                 &#34;kind&#34;: &#34;VolumeSnapshotContent&#34;,
                 &#34;metadata&#34;: {
                   &#34;name&#34;: name,
@@ -1844,7 +3953,7 @@ def volumesnapshotcontent(request):
 <pre><code class="python">def wait_for_volumesnapshot_ready(volumesnapshot_name, namespace, ready_to_use=True): # NOQA
     api = get_custom_object_api_client()
     api_group = &#34;snapshot.storage.k8s.io&#34;
-    api_version = &#34;v1beta1&#34;
+    api_version = &#34;v1&#34;
     plural = &#34;volumesnapshots&#34;
 
     for i in range(RETRY_COUNTS):
@@ -1861,6 +3970,41 @@ def volumesnapshotcontent(request):
 
     assert v[&#34;status&#34;][&#34;readyToUse&#34;] is ready_to_use
     return v</code></pre>
+</details>
+</dd>
+<dt id="tests.test_csi_snapshotter.wait_volumesnapshot_deleted"><code class="name flex">
+<span>def <span class="ident">wait_volumesnapshot_deleted</span></span>(<span>name, namespace, retry_counts=3, can_be_deleted=True)</span>
+</code></dt>
+<dd>
+<div class="desc"></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def wait_volumesnapshot_deleted(name,
+                                namespace,
+                                retry_counts=RETRY_COMMAND_COUNT,
+                                can_be_deleted=True):
+    api = get_custom_object_api_client()
+    api_group = &#34;snapshot.storage.k8s.io&#34;
+    api_version = &#34;v1&#34;
+    plural = &#34;volumesnapshots&#34;
+
+    deleted = False
+
+    for i in range(retry_counts):
+        try:
+            api.get_namespaced_custom_object(group=api_group,
+                                             version=api_version,
+                                             namespace=namespace,
+                                             plural=plural,
+                                             name=name)
+        except Exception:
+            deleted = True
+            break
+        time.sleep(RETRY_INTERVAL)
+
+    assert deleted == can_be_deleted</code></pre>
 </details>
 </dd>
 </dl>
@@ -1881,18 +4025,29 @@ def volumesnapshotcontent(request):
 </li>
 <li><h3><a href="#header-functions">Functions</a></h3>
 <ul class="">
+<li><code><a title="tests.test_csi_snapshotter.create_pod_from_bi_type_volumesnapshot_pvc_and_check_data" href="#tests.test_csi_snapshotter.create_pod_from_bi_type_volumesnapshot_pvc_and_check_data">create_pod_from_bi_type_volumesnapshot_pvc_and_check_data</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.delete_volumesnapshot" href="#tests.test_csi_snapshotter.delete_volumesnapshot">delete_volumesnapshot</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.get_volumesnapshotcontent" href="#tests.test_csi_snapshotter.get_volumesnapshotcontent">get_volumesnapshotcontent</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.prepare_bi_type_test" href="#tests.test_csi_snapshotter.prepare_bi_type_test">prepare_bi_type_test</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.prepare_test_csi_snapshot" href="#tests.test_csi_snapshotter.prepare_test_csi_snapshot">prepare_test_csi_snapshot</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.restore_csi_volume_snapshot" href="#tests.test_csi_snapshotter.restore_csi_volume_snapshot">restore_csi_volume_snapshot</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_snap_create_csi_snapshot" href="#tests.test_csi_snapshotter.test_csi_snapshot_snap_create_csi_snapshot">test_csi_snapshot_snap_create_csi_snapshot</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_snap_create_volume_from_snapshot" href="#tests.test_csi_snapshotter.test_csi_snapshot_snap_create_volume_from_snapshot">test_csi_snapshot_snap_create_volume_from_snapshot</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist" href="#tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist">test_csi_snapshot_snap_delete_csi_snapshot_snapshot_exist</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist" href="#tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist">test_csi_snapshot_snap_delete_csi_snapshot_snapshot_not_exist</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_volume_detached" href="#tests.test_csi_snapshotter.test_csi_snapshot_snap_delete_csi_snapshot_volume_detached">test_csi_snapshot_snap_delete_csi_snapshot_volume_detached</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_with_bak_param" href="#tests.test_csi_snapshotter.test_csi_snapshot_with_bak_param">test_csi_snapshot_with_bak_param</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_with_invalid_param" href="#tests.test_csi_snapshotter.test_csi_snapshot_with_invalid_param">test_csi_snapshot_with_invalid_param</a></code></li>
-<li><code><a title="tests.test_csi_snapshotter.test_csi_snapshot_with_snap_param" href="#tests.test_csi_snapshotter.test_csi_snapshot_with_snap_param">test_csi_snapshot_with_snap_param</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_volumesnapshot_backing_image_basic" href="#tests.test_csi_snapshotter.test_csi_volumesnapshot_backing_image_basic">test_csi_volumesnapshot_backing_image_basic</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.test_csi_volumesnapshot_basic" href="#tests.test_csi_snapshotter.test_csi_volumesnapshot_basic">test_csi_volumesnapshot_basic</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_existing_backup" href="#tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_existing_backup">test_csi_volumesnapshot_restore_existing_backup</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_on_demand_backing_image" href="#tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_on_demand_backing_image">test_csi_volumesnapshot_restore_on_demand_backing_image</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_pre_provision_backing_image" href="#tests.test_csi_snapshotter.test_csi_volumesnapshot_restore_pre_provision_backing_image">test_csi_volumesnapshot_restore_pre_provision_backing_image</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.volumesnapshot" href="#tests.test_csi_snapshotter.volumesnapshot">volumesnapshot</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.volumesnapshotclass" href="#tests.test_csi_snapshotter.volumesnapshotclass">volumesnapshotclass</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.volumesnapshotcontent" href="#tests.test_csi_snapshotter.volumesnapshotcontent">volumesnapshotcontent</a></code></li>
 <li><code><a title="tests.test_csi_snapshotter.wait_for_volumesnapshot_ready" href="#tests.test_csi_snapshotter.wait_for_volumesnapshot_ready">wait_for_volumesnapshot_ready</a></code></li>
+<li><code><a title="tests.test_csi_snapshotter.wait_volumesnapshot_deleted" href="#tests.test_csi_snapshotter.wait_volumesnapshot_deleted">wait_volumesnapshot_deleted</a></code></li>
 </ul>
 </li>
 </ul>

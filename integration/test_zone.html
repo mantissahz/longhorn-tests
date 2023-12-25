@@ -31,30 +31,51 @@ import time
 
 from random import randrange
 
-import common
 from common import client # NOQA
 from common import core_api  # NOQA
 from common import pvc, pod  # NOQA
 from common import volume_name # NOQA
-from common import create_and_check_volume
+
+from common import cleanup_node_disks
 from common import get_self_host_id
+
+from common import get_update_disks
+from common import update_node_disks
+
+from common import create_and_wait_pod
+from common import create_pv_for_volume
+from common import create_pvc_for_volume
+from common import delete_and_wait_pod
+
+from common import create_and_check_volume
+from common import wait_for_volume_condition_scheduled
 from common import wait_for_volume_degraded
+from common import wait_for_volume_detached
+from common import wait_for_volume_delete
 from common import wait_for_volume_healthy
 from common import wait_for_volume_replica_count
+
+from common import get_host_replica_count
+
 from common import get_k8s_zone_label
 from common import set_k8s_node_zone_label
-from common import wait_for_volume_condition_scheduled
-from common import wait_for_volume_delete
+from common import set_node_cordon
+from common import set_node_tags
+from common import wait_for_node_tag_update
+
+from common import update_setting
+
+from common import CONDITION_STATUS_TRUE
 from common import RETRY_COUNTS
 from common import RETRY_INTERVAL
 from common import RETRY_INTERVAL_LONG
-from common import CONDITION_STATUS_TRUE
+from common import SETTING_DEFAULT_DATA_LOCALITY
 from common import SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY
 from common import SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY
 from common import SETTING_REPLICA_AUTO_BALANCE
-from common import SETTING_DEFAULT_DATA_LOCALITY
 
 from test_scheduling import wait_new_replica_ready
+
 
 ZONE1 = &#34;lh-zone1&#34;
 ZONE2 = &#34;lh-zone2&#34;
@@ -337,12 +358,9 @@ def test_replica_auto_balance_zone_least_effort(client, core_api, volume_name): 
         zone-2 replica count != 0.
         zone-3 replica count != 0.
     &#34;&#34;&#34;
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -445,12 +463,9 @@ def test_replica_auto_balance_zone_best_effort(client, core_api, volume_name):  
         2 replicas running in zone-3.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -520,6 +535,252 @@ def test_replica_auto_balance_zone_best_effort(client, core_api, volume_name):  
     assert z3_r_count == 2
 
 
+def test_replica_auto_balance_when_disabled_disk_scheduling_in_zone(client, core_api, volume_name):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when disk scheduling is disabled on nodes
+              in a zone.
+
+    Issue: https://github.com/longhorn/longhorn/issues/6508
+
+    Given `replica-soft-anti-affinity` setting is `true`.
+    And node-1 is in zone-1.
+        node-2 is in zone-2.
+        node-3 is in zone-3.
+    And disk scheduling is disabled on node-3.
+    And create a volume with 3 replicas.
+    And attach the volume to test pod node.
+    And 3 replicas running in zone-1 and zone-2.
+        0 replicas running in zone-3.
+
+    When set `replica-auto-balance` to `best-effort`.
+
+    Then 3 replicas running in zone-1 and zone-2.
+         0 replicas running in zone-3.
+    And replica count remains stable across zones and nodes.
+    &#34;&#34;&#34;
+    # Set `replica-soft-anti-affinity` to `true`.
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    # Assign nodes to respective zones
+    node1, node2, node3 = client.list_node()
+    set_k8s_node_zone_label(core_api, node1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, node2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, node3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    # Disable disk scheduling on node 3
+    cleanup_node_disks(client, node3.name)
+
+    # Create a volume with 3 replicas
+    num_of_replicas = 3
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=num_of_replicas)
+
+    # Wait for the volume to detach and attach it to the test pod node
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    # Define a function to assert replica count
+    def assert_replica_count(is_stable=False):
+        for _ in range(RETRY_COUNTS):
+            time.sleep(RETRY_INTERVAL)
+
+            zone3_replica_count = get_zone_replica_count(
+                client, volume_name, ZONE3, chk_running=True)
+            assert zone3_replica_count == 0
+
+            total_replica_count = \
+                get_zone_replica_count(
+                    client, volume_name, ZONE1, chk_running=True) + \
+                get_zone_replica_count(
+                    client, volume_name, ZONE2, chk_running=True)
+
+            if is_stable:
+                assert total_replica_count == num_of_replicas
+            elif total_replica_count == num_of_replicas:
+                break
+
+        assert total_replica_count == 3
+
+    # Perform the initial assertion to ensure the replica count is as expected
+    assert_replica_count()
+
+    # Update the replica-auto-balance setting to `best-effort`
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+
+    # Perform the final assertion to ensure the replica count is as expected,
+    # and stable after the setting update
+    assert_replica_count(is_stable=True)
+
+
+def test_replica_auto_balance_when_no_storage_available_in_zone(client, core_api, volume_name):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when there is no storage available on nodes
+              in a zone.
+
+    Issue: https://github.com/longhorn/longhorn/issues/6671
+
+    Given `replica-soft-anti-affinity` setting is `true`.
+    And node-1 is in zone-1.
+        node-2 is in zone-2.
+        node-3 is in zone-3.
+    And fill up the storage on node-3.
+    And create a volume with 3 replicas.
+    And attach the volume to test pod node.
+    And 3 replicas running in zone-1 and zone-2.
+        0 replicas running in zone-3.
+
+    When set `replica-auto-balance` to `best-effort`.
+
+    Then 3 replicas running in zone-1 and zone-2.
+         0 replicas running in zone-3.
+    And replica count remains stable across zones and nodes.
+    &#34;&#34;&#34;
+    # Set `replica-soft-anti-affinity` to `true`.
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    # Assign nodes to respective zones
+    node1, node2, node3 = client.list_node()
+    set_k8s_node_zone_label(core_api, node1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, node2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, node3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    # Fill up the storage on node 3
+    for _, disk in node3.disks.items():
+        disk.storageReserved = disk.storageMaximum
+
+    update_disks = get_update_disks(node3.disks)
+    update_node_disks(client, node3.name, disks=update_disks, retry=True)
+
+    # Create a volume with 3 replicas
+    num_of_replicas = 3
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=num_of_replicas)
+
+    # Wait for ht evolume to detach and attache it to the test pod node
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    # Define a function to assert replica count
+    def assert_replica_count(is_stable=False):
+        for _ in range(RETRY_COUNTS):
+            time.sleep(RETRY_INTERVAL)
+
+            zone3_replica_count = get_zone_replica_count(
+                client, volume_name, ZONE3, chk_running=True)
+            assert zone3_replica_count == 0
+
+            total_replica_count = \
+                get_zone_replica_count(
+                    client, volume_name, ZONE1, chk_running=True) + \
+                get_zone_replica_count(
+                    client, volume_name, ZONE2, chk_running=True)
+
+            if is_stable:
+                assert total_replica_count == num_of_replicas
+            elif total_replica_count == num_of_replicas:
+                break
+
+        assert total_replica_count == 3
+
+    # Perform the initial assertion to ensure the replica count is as expected
+    assert_replica_count()
+
+    # Update the replica-auto-balance setting to `best-effort`
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+
+    # Perform the final assertion to ensure the replica count is as expected,
+    # and stable after the setting update
+    assert_replica_count(is_stable=True)
+
+
+def test_replica_auto_balance_when_replica_on_unschedulable_node(client, core_api, volume_name, request):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when replica already running on
+              an unschedulable node.
+
+    Issue: https://github.com/longhorn/longhorn/issues/4502
+
+    Given set `replica-soft-anti-affinity` to `true`.
+    And set `replica-zone-soft-anti-affinity` to `true`.
+    And set volume spec `replicaAutoBalance` to `least-effort`.
+    And set node-1 to zone-1.
+        set node-2 to zone-2.
+        set node-3 to zone-3.
+    And node-2 tagged `AVAIL`.
+        node-3 tagged `AVAIL`.
+    And create a volume with 2 replicas and nodeSelector `AVAIL`.
+    And attach the volume to self-node.
+    And 0 replicas running in zone-1.
+        1 replicas running in zone-2.
+        1 replicas running in zone-3.
+
+    When cordone node-2.
+    Then replicas should remain balanced with,
+         0 replicas running in zone-1.
+         1 replicas running in zone-2.
+         1 replicas running in zone-3.
+    &#34;&#34;&#34;
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+
+    n1, n2, n3 = client.list_node()
+
+    set_k8s_node_zone_label(core_api, n1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, n2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, n3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    client.update(n2, allowScheduling=True, tags=[&#34;AVAIL&#34;])
+    client.update(n3, allowScheduling=True, tags=[&#34;AVAIL&#34;])
+
+    n_replicas = 2
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=n_replicas,
+                                  nodeSelector=[&#34;AVAIL&#34;],
+                                  dataLocality=&#34;best-effort&#34;)
+
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    for _ in range(RETRY_COUNTS):
+        z1_r_count = get_zone_replica_count(
+            client, volume_name, ZONE1, chk_running=True)
+        z2_r_count = get_zone_replica_count(
+            client, volume_name, ZONE2, chk_running=True)
+        z3_r_count = get_zone_replica_count(
+            client, volume_name, ZONE3, chk_running=True)
+
+        if z1_r_count == 0 and (z2_r_count and z3_r_count == 1):
+            break
+        time.sleep(RETRY_INTERVAL)
+    assert z1_r_count == 0 and (z2_r_count and z3_r_count == 1)
+
+    # Set cordon on node
+    def finalizer():
+        set_node_cordon(core_api, n2.name, False)
+    request.addfinalizer(finalizer)
+
+    set_node_cordon(core_api, n2.name, True)
+
+    for _ in range(RETRY_COUNTS):
+        z1_r_count = get_zone_replica_count(
+            client, volume_name, ZONE1, chk_running=True)
+        z2_r_count = get_zone_replica_count(
+            client, volume_name, ZONE2, chk_running=True)
+        z3_r_count = get_zone_replica_count(
+            client, volume_name, ZONE3, chk_running=True)
+        assert z1_r_count == 0 and (z2_r_count and z3_r_count == 1)
+
+        volume = client.by_id_volume(volume_name)
+        for status in volume.rebuildStatus:
+            assert not status.isRebuilding
+
+        time.sleep(RETRY_INTERVAL)
+
+
 def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_api, volume_name, pod):  # NOQA
     &#34;&#34;&#34;
     Background:
@@ -568,14 +829,10 @@ def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_a
         | node-1   | node-2         |
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -587,8 +844,8 @@ def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_a
     n_replicas = 2
     volume = create_and_check_volume(client, volume_name,
                                      num_of_replicas=n_replicas)
-    common.create_pv_for_volume(client, core_api, volume, volume_name)
-    common.create_pvc_for_volume(client, core_api, volume, volume_name)
+    create_pv_for_volume(client, core_api, volume, volume_name)
+    create_pvc_for_volume(client, core_api, volume, volume_name)
     pod[&#39;spec&#39;][&#39;volumes&#39;] = [{
         &#34;name&#34;: &#34;pod-data&#34;,
         &#34;persistentVolumeClaim&#34;: {
@@ -601,18 +858,18 @@ def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_a
         pod[&#39;spec&#39;][&#39;nodeSelector&#39;] = {
             &#34;kubernetes.io/hostname&#34;: pod_node_name
         }
-        common.create_and_wait_pod(core_api, pod)
+        create_and_wait_pod(core_api, pod)
 
         client.update(n3, allowScheduling=False, evictionRequested=True)
 
         duplicate_node = [n1.name, n2.name]
         duplicate_node.remove(pod_node_name)
         for _ in range(RETRY_COUNTS):
-            pod_node_r_count = common.get_host_replica_count(
+            pod_node_r_count = get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            duplicate_node_r_count = common.get_host_replica_count(
+            duplicate_node_r_count = get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=True)
-            balance_node_r_count = common.get_host_replica_count(
+            balance_node_r_count = get_host_replica_count(
                 client, volume_name, n3.name, chk_running=False)
 
             if pod_node_r_count == duplicate_node_r_count == 1 and \
@@ -627,11 +884,11 @@ def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_a
         client.update(n3, allowScheduling=True)
 
         for _ in range(RETRY_COUNTS):
-            pod_node_r_count = common.get_host_replica_count(
+            pod_node_r_count = get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            duplicate_node_r_count = common.get_host_replica_count(
+            duplicate_node_r_count = get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=False)
-            balance_node_r_count = common.get_host_replica_count(
+            balance_node_r_count = get_host_replica_count(
                 client, volume_name, n3.name, chk_running=True)
 
             if pod_node_r_count == balance_node_r_count == 1 and \
@@ -653,14 +910,14 @@ def test_replica_auto_balance_zone_best_effort_with_data_locality(client, core_a
         # re-scheduling happening.
         for _ in range(3):
             time.sleep(5)
-            assert pod_node_r_count == common.get_host_replica_count(
+            assert pod_node_r_count == get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            assert duplicate_node_r_count == common.get_host_replica_count(
+            assert duplicate_node_r_count == get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=False)
-            assert balance_node_r_count == common.get_host_replica_count(
+            assert balance_node_r_count == get_host_replica_count(
                 client, volume_name, n3.name, chk_running=True)
 
-        common.delete_and_wait_pod(core_api, pod[&#39;metadata&#39;][&#39;name&#39;])
+        delete_and_wait_pod(core_api, pod[&#39;metadata&#39;][&#39;name&#39;])
 
 
 def test_replica_auto_balance_node_duplicates_in_multiple_zones(client, core_api, volume_name):  # NOQA
@@ -688,12 +945,9 @@ def test_replica_auto_balance_node_duplicates_in_multiple_zones(client, core_api
     And total of 3 replicas running in zone-1 and zone-2.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -720,11 +974,11 @@ def test_replica_auto_balance_node_duplicates_in_multiple_zones(client, core_api
     client.update(n3, allowScheduling=True)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=True)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=True)
 
         if n1_r_count == n2_r_count == n3_r_count == 1:
@@ -788,14 +1042,10 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
         2 replica running on zode-2.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3, n4, n5 = client.list_node()
 
@@ -817,15 +1067,15 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
     volume.attach(hostId=n1.name)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=False)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=False)
-        n4_r_count = common.get_host_replica_count(
+        n4_r_count = get_host_replica_count(
             client, volume_name, n4.name, chk_running=False)
-        n5_r_count = common.get_host_replica_count(
+        n5_r_count = get_host_replica_count(
             client, volume_name, n5.name, chk_running=False)
 
         if n1_r_count == 4 and \
@@ -859,15 +1109,15 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
     client.update(n3, allowScheduling=True)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=True)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=True)
-        n4_r_count = common.get_host_replica_count(
+        n4_r_count = get_host_replica_count(
             client, volume_name, n4.name, chk_running=True)
-        n5_r_count = common.get_host_replica_count(
+        n5_r_count = get_host_replica_count(
             client, volume_name, n5.name, chk_running=False)
 
         if n1_r_count == n2_r_count == n3_r_count == n4_r_count == 1 and \
@@ -895,7 +1145,72 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
         time.sleep(RETRY_INTERVAL)
 
     assert z1_r_count == 2
-    assert z2_r_count == 2</code></pre>
+    assert z2_r_count == 2
+
+
+def test_replica_auto_balance_should_respect_node_selector(client, core_api, volume_name, pod):  # NOQA
+    &#34;&#34;&#34;
+    Background:
+
+    Given Setting (replica-soft-anti-affinity) is (true).
+    And Setting (replica-zone-soft-anti-affinity) is (true).
+    And Node (node-1, node-2) has tag (tag-0).
+    And Node (node-1) is in zone (lh-zone-1).
+        Node (node-2) is in zone (lh-zone-2).
+        Node (node-3) is in zone (should-not-schedule).
+
+    Scenario Outline: replica auto-balance should respect node-selector.
+
+    Issue: https://github.com/longhorn/longhorn/issues/5971
+
+    Given Volume created.
+    And Volume replica number is (3).
+    And Volume has node selector (tag-0).
+    And Volume attached (node-1).
+    And Replica is in zone (lh-zone-1, lh-zone-2).
+
+    When Setting (replica-auto-balance) is (least-effort).
+
+    Then Replica is in zone (lh-zone-1, lh-zone-2) (loop 10 sec).
+    &#34;&#34;&#34;
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    n1, n2, n3 = client.list_node()
+
+    selected_nodes = [n1, n2]
+
+    node_tag = &#34;tag0&#34;
+    for node in selected_nodes:
+        set_node_tags(client, node, tags=[node_tag])
+        wait_for_node_tag_update(client, node.name, [node_tag])
+
+    set_k8s_node_zone_label(core_api, n1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, n2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, n3.name, &#34;should-not-schedule&#34;)
+    wait_longhorn_node_zone_updated(client)
+
+    n_replicas = 3
+    client.create_volume(name=volume_name,
+                         numberOfReplicas=n_replicas,
+                         nodeSelector=[node_tag])
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=selected_nodes[0].name)
+    z1_r_count = get_zone_replica_count(client, volume_name, ZONE1)
+    z2_r_count = get_zone_replica_count(client, volume_name, ZONE2)
+    assert z1_r_count + z2_r_count == n_replicas
+
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+
+    # Check over 10 seconds to check for unexpected re-scheduling.
+    for _ in range(10):
+        time.sleep(1)
+
+        check_z1_r_count = get_zone_replica_count(client, volume_name, ZONE1)
+        check_z2_r_count = get_zone_replica_count(client, volume_name, ZONE2)
+
+        assert check_z1_r_count == z1_r_count
+        assert check_z2_r_count == z2_r_count</code></pre>
 </details>
 </section>
 <section>
@@ -1032,12 +1347,9 @@ And total of 3 replicas running in zone-1 and zone-2.</p></div>
     And total of 3 replicas running in zone-1 and zone-2.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -1064,11 +1376,11 @@ And total of 3 replicas running in zone-1 and zone-2.</p></div>
     client.update(n3, allowScheduling=True)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=True)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=True)
 
         if n1_r_count == n2_r_count == n3_r_count == 1:
@@ -1083,6 +1395,418 @@ And total of 3 replicas running in zone-1 and zone-2.</p></div>
     z2_r_count = get_zone_replica_count(
         client, volume_name, ZONE2, chk_running=True)
     assert z1_r_count + z2_r_count == n_replicas</code></pre>
+</details>
+</dd>
+<dt id="tests.test_zone.test_replica_auto_balance_should_respect_node_selector"><code class="name flex">
+<span>def <span class="ident">test_replica_auto_balance_should_respect_node_selector</span></span>(<span>client, core_api, volume_name, pod)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Background:</p>
+<p>Given Setting (replica-soft-anti-affinity) is (true).
+And Setting (replica-zone-soft-anti-affinity) is (true).
+And Node (node-1, node-2) has tag (tag-0).
+And Node (node-1) is in zone (lh-zone-1).
+Node (node-2) is in zone (lh-zone-2).
+Node (node-3) is in zone (should-not-schedule).</p>
+<p>Scenario Outline: replica auto-balance should respect node-selector.</p>
+<p>Issue: <a href="https://github.com/longhorn/longhorn/issues/5971">https://github.com/longhorn/longhorn/issues/5971</a></p>
+<p>Given Volume created.
+And Volume replica number is (3).
+And Volume has node selector (tag-0).
+And Volume attached (node-1).
+And Replica is in zone (lh-zone-1, lh-zone-2).</p>
+<p>When Setting (replica-auto-balance) is (least-effort).</p>
+<p>Then Replica is in zone (lh-zone-1, lh-zone-2) (loop 10 sec).</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_replica_auto_balance_should_respect_node_selector(client, core_api, volume_name, pod):  # NOQA
+    &#34;&#34;&#34;
+    Background:
+
+    Given Setting (replica-soft-anti-affinity) is (true).
+    And Setting (replica-zone-soft-anti-affinity) is (true).
+    And Node (node-1, node-2) has tag (tag-0).
+    And Node (node-1) is in zone (lh-zone-1).
+        Node (node-2) is in zone (lh-zone-2).
+        Node (node-3) is in zone (should-not-schedule).
+
+    Scenario Outline: replica auto-balance should respect node-selector.
+
+    Issue: https://github.com/longhorn/longhorn/issues/5971
+
+    Given Volume created.
+    And Volume replica number is (3).
+    And Volume has node selector (tag-0).
+    And Volume attached (node-1).
+    And Replica is in zone (lh-zone-1, lh-zone-2).
+
+    When Setting (replica-auto-balance) is (least-effort).
+
+    Then Replica is in zone (lh-zone-1, lh-zone-2) (loop 10 sec).
+    &#34;&#34;&#34;
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    n1, n2, n3 = client.list_node()
+
+    selected_nodes = [n1, n2]
+
+    node_tag = &#34;tag0&#34;
+    for node in selected_nodes:
+        set_node_tags(client, node, tags=[node_tag])
+        wait_for_node_tag_update(client, node.name, [node_tag])
+
+    set_k8s_node_zone_label(core_api, n1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, n2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, n3.name, &#34;should-not-schedule&#34;)
+    wait_longhorn_node_zone_updated(client)
+
+    n_replicas = 3
+    client.create_volume(name=volume_name,
+                         numberOfReplicas=n_replicas,
+                         nodeSelector=[node_tag])
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=selected_nodes[0].name)
+    z1_r_count = get_zone_replica_count(client, volume_name, ZONE1)
+    z2_r_count = get_zone_replica_count(client, volume_name, ZONE2)
+    assert z1_r_count + z2_r_count == n_replicas
+
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+
+    # Check over 10 seconds to check for unexpected re-scheduling.
+    for _ in range(10):
+        time.sleep(1)
+
+        check_z1_r_count = get_zone_replica_count(client, volume_name, ZONE1)
+        check_z2_r_count = get_zone_replica_count(client, volume_name, ZONE2)
+
+        assert check_z1_r_count == z1_r_count
+        assert check_z2_r_count == z2_r_count</code></pre>
+</details>
+</dd>
+<dt id="tests.test_zone.test_replica_auto_balance_when_disabled_disk_scheduling_in_zone"><code class="name flex">
+<span>def <span class="ident">test_replica_auto_balance_when_disabled_disk_scheduling_in_zone</span></span>(<span>client, core_api, volume_name)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Scenario: replica auto-balance when disk scheduling is disabled on nodes
+in a zone.</p>
+<p>Issue: <a href="https://github.com/longhorn/longhorn/issues/6508">https://github.com/longhorn/longhorn/issues/6508</a></p>
+<p>Given <code>replica-soft-anti-affinity</code> setting is <code>true</code>.
+And node-1 is in zone-1.
+node-2 is in zone-2.
+node-3 is in zone-3.
+And disk scheduling is disabled on node-3.
+And create a volume with 3 replicas.
+And attach the volume to test pod node.
+And 3 replicas running in zone-1 and zone-2.
+0 replicas running in zone-3.</p>
+<p>When set <code>replica-auto-balance</code> to <code>best-effort</code>.</p>
+<p>Then 3 replicas running in zone-1 and zone-2.
+0 replicas running in zone-3.
+And replica count remains stable across zones and nodes.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_replica_auto_balance_when_disabled_disk_scheduling_in_zone(client, core_api, volume_name):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when disk scheduling is disabled on nodes
+              in a zone.
+
+    Issue: https://github.com/longhorn/longhorn/issues/6508
+
+    Given `replica-soft-anti-affinity` setting is `true`.
+    And node-1 is in zone-1.
+        node-2 is in zone-2.
+        node-3 is in zone-3.
+    And disk scheduling is disabled on node-3.
+    And create a volume with 3 replicas.
+    And attach the volume to test pod node.
+    And 3 replicas running in zone-1 and zone-2.
+        0 replicas running in zone-3.
+
+    When set `replica-auto-balance` to `best-effort`.
+
+    Then 3 replicas running in zone-1 and zone-2.
+         0 replicas running in zone-3.
+    And replica count remains stable across zones and nodes.
+    &#34;&#34;&#34;
+    # Set `replica-soft-anti-affinity` to `true`.
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    # Assign nodes to respective zones
+    node1, node2, node3 = client.list_node()
+    set_k8s_node_zone_label(core_api, node1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, node2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, node3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    # Disable disk scheduling on node 3
+    cleanup_node_disks(client, node3.name)
+
+    # Create a volume with 3 replicas
+    num_of_replicas = 3
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=num_of_replicas)
+
+    # Wait for the volume to detach and attach it to the test pod node
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    # Define a function to assert replica count
+    def assert_replica_count(is_stable=False):
+        for _ in range(RETRY_COUNTS):
+            time.sleep(RETRY_INTERVAL)
+
+            zone3_replica_count = get_zone_replica_count(
+                client, volume_name, ZONE3, chk_running=True)
+            assert zone3_replica_count == 0
+
+            total_replica_count = \
+                get_zone_replica_count(
+                    client, volume_name, ZONE1, chk_running=True) + \
+                get_zone_replica_count(
+                    client, volume_name, ZONE2, chk_running=True)
+
+            if is_stable:
+                assert total_replica_count == num_of_replicas
+            elif total_replica_count == num_of_replicas:
+                break
+
+        assert total_replica_count == 3
+
+    # Perform the initial assertion to ensure the replica count is as expected
+    assert_replica_count()
+
+    # Update the replica-auto-balance setting to `best-effort`
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+
+    # Perform the final assertion to ensure the replica count is as expected,
+    # and stable after the setting update
+    assert_replica_count(is_stable=True)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_zone.test_replica_auto_balance_when_no_storage_available_in_zone"><code class="name flex">
+<span>def <span class="ident">test_replica_auto_balance_when_no_storage_available_in_zone</span></span>(<span>client, core_api, volume_name)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Scenario: replica auto-balance when there is no storage available on nodes
+in a zone.</p>
+<p>Issue: <a href="https://github.com/longhorn/longhorn/issues/6671">https://github.com/longhorn/longhorn/issues/6671</a></p>
+<p>Given <code>replica-soft-anti-affinity</code> setting is <code>true</code>.
+And node-1 is in zone-1.
+node-2 is in zone-2.
+node-3 is in zone-3.
+And fill up the storage on node-3.
+And create a volume with 3 replicas.
+And attach the volume to test pod node.
+And 3 replicas running in zone-1 and zone-2.
+0 replicas running in zone-3.</p>
+<p>When set <code>replica-auto-balance</code> to <code>best-effort</code>.</p>
+<p>Then 3 replicas running in zone-1 and zone-2.
+0 replicas running in zone-3.
+And replica count remains stable across zones and nodes.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_replica_auto_balance_when_no_storage_available_in_zone(client, core_api, volume_name):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when there is no storage available on nodes
+              in a zone.
+
+    Issue: https://github.com/longhorn/longhorn/issues/6671
+
+    Given `replica-soft-anti-affinity` setting is `true`.
+    And node-1 is in zone-1.
+        node-2 is in zone-2.
+        node-3 is in zone-3.
+    And fill up the storage on node-3.
+    And create a volume with 3 replicas.
+    And attach the volume to test pod node.
+    And 3 replicas running in zone-1 and zone-2.
+        0 replicas running in zone-3.
+
+    When set `replica-auto-balance` to `best-effort`.
+
+    Then 3 replicas running in zone-1 and zone-2.
+         0 replicas running in zone-3.
+    And replica count remains stable across zones and nodes.
+    &#34;&#34;&#34;
+    # Set `replica-soft-anti-affinity` to `true`.
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+
+    # Assign nodes to respective zones
+    node1, node2, node3 = client.list_node()
+    set_k8s_node_zone_label(core_api, node1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, node2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, node3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    # Fill up the storage on node 3
+    for _, disk in node3.disks.items():
+        disk.storageReserved = disk.storageMaximum
+
+    update_disks = get_update_disks(node3.disks)
+    update_node_disks(client, node3.name, disks=update_disks, retry=True)
+
+    # Create a volume with 3 replicas
+    num_of_replicas = 3
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=num_of_replicas)
+
+    # Wait for ht evolume to detach and attache it to the test pod node
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    # Define a function to assert replica count
+    def assert_replica_count(is_stable=False):
+        for _ in range(RETRY_COUNTS):
+            time.sleep(RETRY_INTERVAL)
+
+            zone3_replica_count = get_zone_replica_count(
+                client, volume_name, ZONE3, chk_running=True)
+            assert zone3_replica_count == 0
+
+            total_replica_count = \
+                get_zone_replica_count(
+                    client, volume_name, ZONE1, chk_running=True) + \
+                get_zone_replica_count(
+                    client, volume_name, ZONE2, chk_running=True)
+
+            if is_stable:
+                assert total_replica_count == num_of_replicas
+            elif total_replica_count == num_of_replicas:
+                break
+
+        assert total_replica_count == 3
+
+    # Perform the initial assertion to ensure the replica count is as expected
+    assert_replica_count()
+
+    # Update the replica-auto-balance setting to `best-effort`
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+
+    # Perform the final assertion to ensure the replica count is as expected,
+    # and stable after the setting update
+    assert_replica_count(is_stable=True)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_zone.test_replica_auto_balance_when_replica_on_unschedulable_node"><code class="name flex">
+<span>def <span class="ident">test_replica_auto_balance_when_replica_on_unschedulable_node</span></span>(<span>client, core_api, volume_name, request)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Scenario: replica auto-balance when replica already running on
+an unschedulable node.</p>
+<p>Issue: <a href="https://github.com/longhorn/longhorn/issues/4502">https://github.com/longhorn/longhorn/issues/4502</a></p>
+<p>Given set <code>replica-soft-anti-affinity</code> to <code>true</code>.
+And set <code>replica-zone-soft-anti-affinity</code> to <code>true</code>.
+And set volume spec <code>replicaAutoBalance</code> to <code>least-effort</code>.
+And set node-1 to zone-1.
+set node-2 to zone-2.
+set node-3 to zone-3.
+And node-2 tagged <code>AVAIL</code>.
+node-3 tagged <code>AVAIL</code>.
+And create a volume with 2 replicas and nodeSelector <code>AVAIL</code>.
+And attach the volume to self-node.
+And 0 replicas running in zone-1.
+1 replicas running in zone-2.
+1 replicas running in zone-3.</p>
+<p>When cordone node-2.
+Then replicas should remain balanced with,
+0 replicas running in zone-1.
+1 replicas running in zone-2.
+1 replicas running in zone-3.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_replica_auto_balance_when_replica_on_unschedulable_node(client, core_api, volume_name, request):  # NOQA
+    &#34;&#34;&#34;
+    Scenario: replica auto-balance when replica already running on
+              an unschedulable node.
+
+    Issue: https://github.com/longhorn/longhorn/issues/4502
+
+    Given set `replica-soft-anti-affinity` to `true`.
+    And set `replica-zone-soft-anti-affinity` to `true`.
+    And set volume spec `replicaAutoBalance` to `least-effort`.
+    And set node-1 to zone-1.
+        set node-2 to zone-2.
+        set node-3 to zone-3.
+    And node-2 tagged `AVAIL`.
+        node-3 tagged `AVAIL`.
+    And create a volume with 2 replicas and nodeSelector `AVAIL`.
+    And attach the volume to self-node.
+    And 0 replicas running in zone-1.
+        1 replicas running in zone-2.
+        1 replicas running in zone-3.
+
+    When cordone node-2.
+    Then replicas should remain balanced with,
+         0 replicas running in zone-1.
+         1 replicas running in zone-2.
+         1 replicas running in zone-3.
+    &#34;&#34;&#34;
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+
+    n1, n2, n3 = client.list_node()
+
+    set_k8s_node_zone_label(core_api, n1.name, ZONE1)
+    set_k8s_node_zone_label(core_api, n2.name, ZONE2)
+    set_k8s_node_zone_label(core_api, n3.name, ZONE3)
+    wait_longhorn_node_zone_updated(client)
+
+    client.update(n2, allowScheduling=True, tags=[&#34;AVAIL&#34;])
+    client.update(n3, allowScheduling=True, tags=[&#34;AVAIL&#34;])
+
+    n_replicas = 2
+    volume = client.create_volume(name=volume_name,
+                                  numberOfReplicas=n_replicas,
+                                  nodeSelector=[&#34;AVAIL&#34;],
+                                  dataLocality=&#34;best-effort&#34;)
+
+    volume = wait_for_volume_detached(client, volume_name)
+    volume.attach(hostId=get_self_host_id())
+
+    for _ in range(RETRY_COUNTS):
+        z1_r_count = get_zone_replica_count(
+            client, volume_name, ZONE1, chk_running=True)
+        z2_r_count = get_zone_replica_count(
+            client, volume_name, ZONE2, chk_running=True)
+        z3_r_count = get_zone_replica_count(
+            client, volume_name, ZONE3, chk_running=True)
+
+        if z1_r_count == 0 and (z2_r_count and z3_r_count == 1):
+            break
+        time.sleep(RETRY_INTERVAL)
+    assert z1_r_count == 0 and (z2_r_count and z3_r_count == 1)
+
+    # Set cordon on node
+    def finalizer():
+        set_node_cordon(core_api, n2.name, False)
+    request.addfinalizer(finalizer)
+
+    set_node_cordon(core_api, n2.name, True)
+
+    for _ in range(RETRY_COUNTS):
+        z1_r_count = get_zone_replica_count(
+            client, volume_name, ZONE1, chk_running=True)
+        z2_r_count = get_zone_replica_count(
+            client, volume_name, ZONE2, chk_running=True)
+        z3_r_count = get_zone_replica_count(
+            client, volume_name, ZONE3, chk_running=True)
+        assert z1_r_count == 0 and (z2_r_count and z3_r_count == 1)
+
+        volume = client.by_id_volume(volume_name)
+        for status in volume.rebuildStatus:
+            assert not status.isRebuilding
+
+        time.sleep(RETRY_INTERVAL)</code></pre>
 </details>
 </dd>
 <dt id="tests.test_zone.test_replica_auto_balance_zone_best_effort"><code class="name flex">
@@ -1148,12 +1872,9 @@ And 2 replicas running in zone-1.
         2 replicas running in zone-3.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -1324,14 +2045,10 @@ To ensure no addition scheduling is happening.
         | node-1   | node-2         |
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -1343,8 +2060,8 @@ To ensure no addition scheduling is happening.
     n_replicas = 2
     volume = create_and_check_volume(client, volume_name,
                                      num_of_replicas=n_replicas)
-    common.create_pv_for_volume(client, core_api, volume, volume_name)
-    common.create_pvc_for_volume(client, core_api, volume, volume_name)
+    create_pv_for_volume(client, core_api, volume, volume_name)
+    create_pvc_for_volume(client, core_api, volume, volume_name)
     pod[&#39;spec&#39;][&#39;volumes&#39;] = [{
         &#34;name&#34;: &#34;pod-data&#34;,
         &#34;persistentVolumeClaim&#34;: {
@@ -1357,18 +2074,18 @@ To ensure no addition scheduling is happening.
         pod[&#39;spec&#39;][&#39;nodeSelector&#39;] = {
             &#34;kubernetes.io/hostname&#34;: pod_node_name
         }
-        common.create_and_wait_pod(core_api, pod)
+        create_and_wait_pod(core_api, pod)
 
         client.update(n3, allowScheduling=False, evictionRequested=True)
 
         duplicate_node = [n1.name, n2.name]
         duplicate_node.remove(pod_node_name)
         for _ in range(RETRY_COUNTS):
-            pod_node_r_count = common.get_host_replica_count(
+            pod_node_r_count = get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            duplicate_node_r_count = common.get_host_replica_count(
+            duplicate_node_r_count = get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=True)
-            balance_node_r_count = common.get_host_replica_count(
+            balance_node_r_count = get_host_replica_count(
                 client, volume_name, n3.name, chk_running=False)
 
             if pod_node_r_count == duplicate_node_r_count == 1 and \
@@ -1383,11 +2100,11 @@ To ensure no addition scheduling is happening.
         client.update(n3, allowScheduling=True)
 
         for _ in range(RETRY_COUNTS):
-            pod_node_r_count = common.get_host_replica_count(
+            pod_node_r_count = get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            duplicate_node_r_count = common.get_host_replica_count(
+            duplicate_node_r_count = get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=False)
-            balance_node_r_count = common.get_host_replica_count(
+            balance_node_r_count = get_host_replica_count(
                 client, volume_name, n3.name, chk_running=True)
 
             if pod_node_r_count == balance_node_r_count == 1 and \
@@ -1409,14 +2126,14 @@ To ensure no addition scheduling is happening.
         # re-scheduling happening.
         for _ in range(3):
             time.sleep(5)
-            assert pod_node_r_count == common.get_host_replica_count(
+            assert pod_node_r_count == get_host_replica_count(
                 client, volume_name, pod_node_name, chk_running=True)
-            assert duplicate_node_r_count == common.get_host_replica_count(
+            assert duplicate_node_r_count == get_host_replica_count(
                 client, volume_name, duplicate_node[0], chk_running=False)
-            assert balance_node_r_count == common.get_host_replica_count(
+            assert balance_node_r_count == get_host_replica_count(
                 client, volume_name, n3.name, chk_running=True)
 
-        common.delete_and_wait_pod(core_api, pod[&#39;metadata&#39;][&#39;name&#39;])</code></pre>
+        delete_and_wait_pod(core_api, pod[&#39;metadata&#39;][&#39;name&#39;])</code></pre>
 </details>
 </dd>
 <dt id="tests.test_zone.test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones"><code class="name flex">
@@ -1511,14 +2228,10 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
         2 replica running on zode-2.
     &#34;&#34;&#34;
 
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_DEFAULT_DATA_LOCALITY, &#34;best-effort&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;best-effort&#34;)
 
     n1, n2, n3, n4, n5 = client.list_node()
 
@@ -1540,15 +2253,15 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
     volume.attach(hostId=n1.name)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=False)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=False)
-        n4_r_count = common.get_host_replica_count(
+        n4_r_count = get_host_replica_count(
             client, volume_name, n4.name, chk_running=False)
-        n5_r_count = common.get_host_replica_count(
+        n5_r_count = get_host_replica_count(
             client, volume_name, n5.name, chk_running=False)
 
         if n1_r_count == 4 and \
@@ -1582,15 +2295,15 @@ def test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones(client,
     client.update(n3, allowScheduling=True)
 
     for _ in range(RETRY_COUNTS):
-        n1_r_count = common.get_host_replica_count(
+        n1_r_count = get_host_replica_count(
             client, volume_name, n1.name, chk_running=True)
-        n2_r_count = common.get_host_replica_count(
+        n2_r_count = get_host_replica_count(
             client, volume_name, n2.name, chk_running=True)
-        n3_r_count = common.get_host_replica_count(
+        n3_r_count = get_host_replica_count(
             client, volume_name, n3.name, chk_running=True)
-        n4_r_count = common.get_host_replica_count(
+        n4_r_count = get_host_replica_count(
             client, volume_name, n4.name, chk_running=True)
-        n5_r_count = common.get_host_replica_count(
+        n5_r_count = get_host_replica_count(
             client, volume_name, n5.name, chk_running=False)
 
         if n1_r_count == n2_r_count == n3_r_count == n4_r_count == 1 and \
@@ -1683,12 +2396,9 @@ zone-3 replica count != 0.</p></div>
         zone-2 replica count != 0.
         zone-3 replica count != 0.
     &#34;&#34;&#34;
-    common.update_setting(client,
-                          SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
-    common.update_setting(client,
-                          SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
+    update_setting(client, SETTING_REPLICA_NODE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_ZONE_SOFT_ANTI_AFFINITY, &#34;true&#34;)
+    update_setting(client, SETTING_REPLICA_AUTO_BALANCE, &#34;least-effort&#34;)
 
     n1, n2, n3 = client.list_node()
 
@@ -2027,6 +2737,10 @@ def test_replica_zone_anti_affinity(client, core_api, volume_name, k8s_node_zone
 <li><code><a title="tests.test_zone.get_zone_replica_count" href="#tests.test_zone.get_zone_replica_count">get_zone_replica_count</a></code></li>
 <li><code><a title="tests.test_zone.k8s_node_zone_tags" href="#tests.test_zone.k8s_node_zone_tags">k8s_node_zone_tags</a></code></li>
 <li><code><a title="tests.test_zone.test_replica_auto_balance_node_duplicates_in_multiple_zones" href="#tests.test_zone.test_replica_auto_balance_node_duplicates_in_multiple_zones">test_replica_auto_balance_node_duplicates_in_multiple_zones</a></code></li>
+<li><code><a title="tests.test_zone.test_replica_auto_balance_should_respect_node_selector" href="#tests.test_zone.test_replica_auto_balance_should_respect_node_selector">test_replica_auto_balance_should_respect_node_selector</a></code></li>
+<li><code><a title="tests.test_zone.test_replica_auto_balance_when_disabled_disk_scheduling_in_zone" href="#tests.test_zone.test_replica_auto_balance_when_disabled_disk_scheduling_in_zone">test_replica_auto_balance_when_disabled_disk_scheduling_in_zone</a></code></li>
+<li><code><a title="tests.test_zone.test_replica_auto_balance_when_no_storage_available_in_zone" href="#tests.test_zone.test_replica_auto_balance_when_no_storage_available_in_zone">test_replica_auto_balance_when_no_storage_available_in_zone</a></code></li>
+<li><code><a title="tests.test_zone.test_replica_auto_balance_when_replica_on_unschedulable_node" href="#tests.test_zone.test_replica_auto_balance_when_replica_on_unschedulable_node">test_replica_auto_balance_when_replica_on_unschedulable_node</a></code></li>
 <li><code><a title="tests.test_zone.test_replica_auto_balance_zone_best_effort" href="#tests.test_zone.test_replica_auto_balance_zone_best_effort">test_replica_auto_balance_zone_best_effort</a></code></li>
 <li><code><a title="tests.test_zone.test_replica_auto_balance_zone_best_effort_with_data_locality" href="#tests.test_zone.test_replica_auto_balance_zone_best_effort_with_data_locality">test_replica_auto_balance_zone_best_effort_with_data_locality</a></code></li>
 <li><code><a title="tests.test_zone.test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones" href="#tests.test_zone.test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones">test_replica_auto_balance_zone_best_effort_with_uneven_node_in_zones</a></code></li>

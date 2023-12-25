@@ -42,9 +42,18 @@ SKIP_RECURRING_JOB_OPT = &#34;--skip-recurring-job-test&#34;
 SKIP_INFRA_OPT = &#34;--skip-infra-test&#34;
 INCLUDE_STRESS_OPT = &#34;--include-stress-test&#34;
 INCLUDE_UPGRADE_OPT = &#34;--include-upgrade-test&#34;
+INCLUDE_CA_OPT = &#34;--include-cluster-autoscaler-test&#34;
 
-UPGRADE_LH_MANAGER_REPO_URL = &#34;--upgrade-lh-manager-repo-url&#34;
-UPGRADE_LH_MANAGER_REPO_BRANCH = &#34;--upgrade-lh-manager-repo-branch&#34;
+LH_INSTALL_METHOD = &#34;--lh-install-method&#34;
+RANCHER_HOSTNAME = &#34;--rancher-hostname&#34;
+RANCHER_ACCESS_KEY = &#34;--rancher-access-key&#34;
+RANCHER_SECRET_KEY = &#34;--rancher-secret-key&#34;
+RANCHER_CHART_INSTALL_VERSION = &#34;--rancher-chart-install-version&#34;
+LONGHORN_REPO = &#34;--longhorn-repo&#34;
+FLUX_HELM_CHART_URL = &#34;--flux-helm-chart-url&#34;
+FLUX_HELM_CHART_VERSION = &#34;--flux-helm-chart-version&#34;
+UPGRADE_LH_REPO_URL = &#34;--upgrade-lh-repo-url&#34;
+UPGRADE_LH_REPO_BRANCH = &#34;--upgrade-lh-repo-branch&#34;
 UPGRADE_LH_MANAGER_IMAGE = &#34;--upgrade-lh-manager-image&#34;
 UPGRADE_LH_ENGINE_IMAGE = &#34;--upgrade-lh-engine-image&#34;
 UPGRADE_LH_INSTANCE_MANAGER_IMAGE = &#34;--upgrade-lh-instance-manager-image&#34;
@@ -73,18 +82,67 @@ def pytest_addoption(parser):
                      default=False,
                      help=&#34;include upgrade tests (default: False)&#34;)
 
-    longhorn_manager_repo_url =\
-        &#34;https://github.com/longhorn/longhorn-manager.git&#34;
-    parser.addoption(UPGRADE_LH_MANAGER_REPO_URL, action=&#34;store&#34;,
-                     default=longhorn_manager_repo_url,
-                     help=&#39;&#39;&#39;set longhorn-manger repo url, this will be used
+    parser.addoption(INCLUDE_CA_OPT, action=&#34;store_true&#34;,
+                     default=False,
+                     help=&#34;include cluster autoscaler tests (default: False)&#34;)
+
+    parser.addoption(LH_INSTALL_METHOD, action=&#34;store&#34;,
+                     default=&#34;manifest&#34;,
+                     help=&#39;&#39;&#39;set longhorn install method, this will be used
+                     to determine how to upgrade longhorn for test_upgrade
+                     (default: manifest&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_HOSTNAME, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     where rancher is hosted&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_ACCESS_KEY, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the access key and secret key to have the permission to
+                     operate it&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_SECRET_KEY, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the access key and secret key to have the permission to
+                     operate it&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_CHART_INSTALL_VERSION, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the longhorn chart version you would like to install like
+                     102.2.1+up1.4.2&#39;&#39;&#39;)
+
+    parser.addoption(LONGHORN_REPO, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the longhorn dockerhub repo of longhorn components like
+                     longhornio or rancher&#39;&#39;&#39;)
+
+    parser.addoption(FLUX_HELM_CHART_URL, action=&#34;store&#34;,
+                     default=&#34;https://charts.longhorn.io&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is flux, specify the
+                     url of flux helm repository resource&#39;&#39;&#39;)
+
+    parser.addoption(FLUX_HELM_CHART_VERSION, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is flux, specify the
+                     chart version when create flux helm release resource&#39;&#39;&#39;)
+
+    longhorn_repo_url =\
+        &#34;https://github.com/longhorn/longhorn.git&#34;
+    parser.addoption(UPGRADE_LH_REPO_URL, action=&#34;store&#34;,
+                     default=longhorn_repo_url,
+                     help=&#39;&#39;&#39;set longhorn repo url, this will be used
                      to generate longhorn yaml manifest for test_upgrade
                      (default:
-                     https://github.com/longhorn/longhorn-manager.git)&#39;&#39;&#39;)
+                     https://github.com/longhorn/longhorn.git)&#39;&#39;&#39;)
 
-    parser.addoption(UPGRADE_LH_MANAGER_REPO_BRANCH, action=&#34;store&#34;,
+    parser.addoption(UPGRADE_LH_REPO_BRANCH, action=&#34;store&#34;,
                      default=&#34;master&#34;,
-                     help=&#39;&#39;&#39;set longhorn-manger repo branch, this will be used
+                     help=&#39;&#39;&#39;set longhorn repo branch, this will be used
                      to generate longhorn yaml manifest for test_upgrade
                      (default: master)&#39;&#39;&#39;)
 
@@ -202,6 +260,15 @@ def pytest_collection_modifyitems(config, items):
             if &#34;upgrade&#34; in item.keywords:
                 item.add_marker(skip_upgrade)
 
+    if not config.getoption(INCLUDE_CA_OPT):
+        skip_upgrade = pytest.mark.skip(reason=&#34;include &#34; +
+                                        INCLUDE_CA_OPT +
+                                        &#34; option to run&#34;)
+
+        for item in items:
+            if &#34;cluster_autoscaler&#34; in item.keywords:
+                item.add_marker(skip_upgrade)
+
 
 def pytest_exception_interact(call, report):
 
@@ -252,18 +319,67 @@ def pytest_exception_interact(call, report):
                      default=False,
                      help=&#34;include upgrade tests (default: False)&#34;)
 
-    longhorn_manager_repo_url =\
-        &#34;https://github.com/longhorn/longhorn-manager.git&#34;
-    parser.addoption(UPGRADE_LH_MANAGER_REPO_URL, action=&#34;store&#34;,
-                     default=longhorn_manager_repo_url,
-                     help=&#39;&#39;&#39;set longhorn-manger repo url, this will be used
+    parser.addoption(INCLUDE_CA_OPT, action=&#34;store_true&#34;,
+                     default=False,
+                     help=&#34;include cluster autoscaler tests (default: False)&#34;)
+
+    parser.addoption(LH_INSTALL_METHOD, action=&#34;store&#34;,
+                     default=&#34;manifest&#34;,
+                     help=&#39;&#39;&#39;set longhorn install method, this will be used
+                     to determine how to upgrade longhorn for test_upgrade
+                     (default: manifest&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_HOSTNAME, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     where rancher is hosted&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_ACCESS_KEY, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the access key and secret key to have the permission to
+                     operate it&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_SECRET_KEY, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the access key and secret key to have the permission to
+                     operate it&#39;&#39;&#39;)
+
+    parser.addoption(RANCHER_CHART_INSTALL_VERSION, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the longhorn chart version you would like to install like
+                     102.2.1+up1.4.2&#39;&#39;&#39;)
+
+    parser.addoption(LONGHORN_REPO, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is rancher, specify
+                     the longhorn dockerhub repo of longhorn components like
+                     longhornio or rancher&#39;&#39;&#39;)
+
+    parser.addoption(FLUX_HELM_CHART_URL, action=&#34;store&#34;,
+                     default=&#34;https://charts.longhorn.io&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is flux, specify the
+                     url of flux helm repository resource&#39;&#39;&#39;)
+
+    parser.addoption(FLUX_HELM_CHART_VERSION, action=&#34;store&#34;,
+                     default=&#34;&#34;,
+                     help=&#39;&#39;&#39;if longhorn install method is flux, specify the
+                     chart version when create flux helm release resource&#39;&#39;&#39;)
+
+    longhorn_repo_url =\
+        &#34;https://github.com/longhorn/longhorn.git&#34;
+    parser.addoption(UPGRADE_LH_REPO_URL, action=&#34;store&#34;,
+                     default=longhorn_repo_url,
+                     help=&#39;&#39;&#39;set longhorn repo url, this will be used
                      to generate longhorn yaml manifest for test_upgrade
                      (default:
-                     https://github.com/longhorn/longhorn-manager.git)&#39;&#39;&#39;)
+                     https://github.com/longhorn/longhorn.git)&#39;&#39;&#39;)
 
-    parser.addoption(UPGRADE_LH_MANAGER_REPO_BRANCH, action=&#34;store&#34;,
+    parser.addoption(UPGRADE_LH_REPO_BRANCH, action=&#34;store&#34;,
                      default=&#34;master&#34;,
-                     help=&#39;&#39;&#39;set longhorn-manger repo branch, this will be used
+                     help=&#39;&#39;&#39;set longhorn repo branch, this will be used
                      to generate longhorn yaml manifest for test_upgrade
                      (default: master)&#39;&#39;&#39;)
 
@@ -388,6 +504,15 @@ def pytest_exception_interact(call, report):
 
         for item in items:
             if &#34;upgrade&#34; in item.keywords:
+                item.add_marker(skip_upgrade)
+
+    if not config.getoption(INCLUDE_CA_OPT):
+        skip_upgrade = pytest.mark.skip(reason=&#34;include &#34; +
+                                        INCLUDE_CA_OPT +
+                                        &#34; option to run&#34;)
+
+        for item in items:
+            if &#34;cluster_autoscaler&#34; in item.keywords:
                 item.add_marker(skip_upgrade)</code></pre>
 </details>
 </dd>

@@ -34,6 +34,8 @@ from common import exec_command_in_pod, get_pod_data_md5sum
 from common import create_and_wait_pod, read_volume_data
 from common import get_apps_api_client, wait_statefulset
 from common import create_and_wait_deployment, delete_and_wait_pod
+from common import delete_and_wait_deployment
+from common import delete_and_wait_pvc
 from common import prepare_pod_with_data_in_mb, DATA_SIZE_IN_MB_1
 from common import create_snapshot, wait_for_backup_completion
 from common import find_backup, Gi, volume_name, csi_pv, pod_make  # NOQA
@@ -45,10 +47,16 @@ from common import get_core_api_client, write_pod_volume_random_data
 from common import create_pvc_spec, make_deployment_with_pvc  # NOQA
 from common import core_api, statefulset, pvc, pod, client  # NOQA
 from common import RETRY_COUNTS, RETRY_INTERVAL
+from common import EXPANDED_VOLUME_SIZE
+from common import expand_and_wait_for_pvc, wait_for_volume_expansion
+from common import wait_deployment_replica_ready, wait_for_volume_healthy
+from common import crypto_secret, storage_class  # NOQA
+from common import create_crypto_secret, create_storage_class
 from backupstore import set_random_backupstore # NOQA
 from multiprocessing import Pool
 
 import time
+import pytest
 
 
 def write_data_into_pod(pod_name_and_data_path):
@@ -541,7 +549,171 @@ def test_restore_rwo_volume_to_rwx(set_random_backupstore, client, core_api, vol
     md5sum_pod1 = get_pod_data_md5sum(core_api, pod_name_1, data_path)
     md5sum_pod2 = get_pod_data_md5sum(core_api, pod_name_2, data_path)
 
-    assert md5sum == md5sum_pod1 == md5sum_pod2</code></pre>
+    assert md5sum == md5sum_pod1 == md5sum_pod2
+
+
+@pytest.mark.skip(reason=&#34;TODO&#34;)
+def test_rwx_onine_expansion(): # NOQA
+    &#34;&#34;&#34;
+    Related issue :
+    https://github.com/longhorn/longhorn/issues/2181
+    https://github.com/longhorn/longhorn/issues/2484
+
+    This test case does not cover the UI test mentioned in the related issue&#39;s
+    test steps.&#34;
+
+    Given
+    - Create a rwx pvc using longhorn storage class of size 1 Gi.
+
+    And
+    - Atach it to a workload (deployment) and write some data.
+
+    When
+    - Expand the volume to 5 Gi
+
+    Then
+    - Expansion of volume is completed.
+    - Share manager pod not restart
+
+    And
+    - 1.5 Gi of data is successfully written to the expanded volume.
+    &#34;&#34;&#34;
+    pass
+
+
+def test_rwx_offline_expansion(client, core_api, pvc, make_deployment_with_pvc): # NOQA
+    &#34;&#34;&#34;
+    Related issue :
+    https://github.com/longhorn/longhorn/issues/2181
+    https://github.com/longhorn/longhorn/issues/2484
+
+    This test case does not cover the UI test mentioned in the related issue&#39;s
+    test steps.&#34;
+
+    Given
+    - Create a rwx pvc using longhorn storage class of size 1 Gi.
+
+    And
+    - Atach it to a workload (deployment) and write some data.
+    - Scale down the workload, wait volume detached
+    - Share manager pod will terminate automatically
+    - Expand the volume to 4 Gi, wait exoansion complete
+
+    When
+    - Scale up workload
+
+    Then
+    - Share manager pod created
+    - Volume healthy
+
+    And
+    - 1.5 Gi of data is successfully written to the expanded volume
+    &#34;&#34;&#34;
+    pvc_name = &#39;pvc-deployment-rwx-expand-test&#39;
+    pvc[&#39;metadata&#39;][&#39;name&#39;] = pvc_name
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#39;longhorn&#39;
+    pvc[&#39;spec&#39;][&#39;accessModes&#39;] = [&#39;ReadWriteMany&#39;]
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(1 * Gi)
+
+    core_api.create_namespaced_persistent_volume_claim(
+        body=pvc, namespace=&#39;default&#39;)
+
+    deployment = make_deployment_with_pvc(
+        &#39;deployment-rwx-expand-test&#39;, pvc_name, replicas=1)
+    apps_api = get_apps_api_client()
+    create_and_wait_deployment(apps_api, deployment)
+
+    pv_name = get_volume_name(core_api, pvc_name)
+    deployment_label_selector = &#34;name=&#34; + \
+                                deployment[&#34;metadata&#34;][&#34;labels&#34;][&#34;name&#34;]
+
+    deployment_pod_list = \
+        core_api.list_namespaced_pod(namespace=&#34;default&#34;,
+                                     label_selector=deployment_label_selector)
+
+    pod_name = deployment_pod_list.items[0].metadata.name
+    test_data = generate_random_data(VOLUME_RWTEST_SIZE)
+    write_pod_volume_data(core_api, pod_name, test_data, filename=&#39;test&#39;)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment[&#34;metadata&#34;][&#34;name&#34;])
+
+    wait_for_volume_detached(client, pv_name)
+    expand_and_wait_for_pvc(core_api, pvc, EXPANDED_VOLUME_SIZE*Gi)
+    wait_for_volume_expansion(client, pv_name)
+    wait_for_volume_detached(client, pv_name)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment[&#34;metadata&#34;][&#34;name&#34;])
+    wait_deployment_replica_ready(apps_api, deployment[&#34;metadata&#34;][&#34;name&#34;], 1)
+    wait_for_volume_healthy(client, pv_name)
+
+    deployment_pod_list = \
+        core_api.list_namespaced_pod(namespace=&#34;default&#34;,
+                                     label_selector=deployment_label_selector)
+    pod_name = deployment_pod_list.items[0].metadata.name
+
+    # check data written before expansion
+    resp = read_volume_data(core_api, pod_name, &#34;test&#34;)
+    assert resp == test_data
+
+    data_size_in_mb = 1536
+    write_pod_volume_random_data(core_api, pod_name, &#34;/data/test2&#34;,
+                                 data_size_in_mb)
+    command = &#39;stat -c \&#34;%s\&#34; /data/test2&#39;
+    data_size_in_pod = exec_command_in_pod(core_api, command,
+                                           pod_name,
+                                           &#39;default&#39;)
+    assert int(data_size_in_pod)/1024/1024 == data_size_in_mb
+
+
+def test_encrypted_rwx_volume(core_api, statefulset, storage_class, crypto_secret, pvc, make_deployment_with_pvc):  # NOQA
+    &#34;&#34;&#34;
+    Test creating encrypted rwx volume and use the secret in
+    non longhorn-system namespace.
+
+    1. Create crypto secret in non longhorn-system namespace.
+    2. Create a storage class.
+    3. Create a deployment with a PVC and the pods should be able to running.
+    &#34;&#34;&#34;
+
+    namespace = &#39;default&#39;
+    # Create crypto secret
+    secret = crypto_secret(namespace)
+    create_crypto_secret(secret, namespace)
+
+    # Create storage class
+    storage_class[&#39;reclaimPolicy&#39;] = &#39;Delete&#39;
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/provisioner-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/provisioner-secret-namespace&#39;] = namespace  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-publish-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-publish-secret-namespace&#39;] = namespace  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-stage-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-stage-secret-namespace&#39;] = namespace  # NOQA
+    create_storage_class(storage_class)
+
+    # Create deployment with PVC
+    pvc_name = &#39;pvc-deployment-with-encrypted-rwx-volume&#39;
+    pvc[&#39;metadata&#39;][&#39;name&#39;] = pvc_name
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = storage_class[&#39;metadata&#39;][&#39;name&#39;]
+    pvc[&#39;spec&#39;][&#39;accessModes&#39;] = [&#39;ReadWriteMany&#39;]
+
+    core_api.create_namespaced_persistent_volume_claim(
+        body=pvc, namespace=&#39;default&#39;)
+
+    deployment = make_deployment_with_pvc(
+        &#39;pvc-deployment-with-encrypted-rwx-volume&#39;, pvc_name, replicas=3)
+
+    apps_api = get_apps_api_client()
+    create_and_wait_deployment(apps_api, deployment)
+
+    # Clean up deployment and volume
+    delete_and_wait_deployment(apps_api, deployment[&#34;metadata&#34;][&#34;name&#34;])
+    delete_and_wait_pvc(core_api, pvc_name)</code></pre>
 </details>
 </section>
 <section>
@@ -551,6 +723,66 @@ def test_restore_rwo_volume_to_rwx(set_random_backupstore, client, core_api, vol
 <section>
 <h2 class="section-title" id="header-functions">Functions</h2>
 <dl>
+<dt id="tests.test_rwx.test_encrypted_rwx_volume"><code class="name flex">
+<span>def <span class="ident">test_encrypted_rwx_volume</span></span>(<span>core_api, statefulset, storage_class, crypto_secret, pvc, make_deployment_with_pvc)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Test creating encrypted rwx volume and use the secret in
+non longhorn-system namespace.</p>
+<ol>
+<li>Create crypto secret in non longhorn-system namespace.</li>
+<li>Create a storage class.</li>
+<li>Create a deployment with a PVC and the pods should be able to running.</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_encrypted_rwx_volume(core_api, statefulset, storage_class, crypto_secret, pvc, make_deployment_with_pvc):  # NOQA
+    &#34;&#34;&#34;
+    Test creating encrypted rwx volume and use the secret in
+    non longhorn-system namespace.
+
+    1. Create crypto secret in non longhorn-system namespace.
+    2. Create a storage class.
+    3. Create a deployment with a PVC and the pods should be able to running.
+    &#34;&#34;&#34;
+
+    namespace = &#39;default&#39;
+    # Create crypto secret
+    secret = crypto_secret(namespace)
+    create_crypto_secret(secret, namespace)
+
+    # Create storage class
+    storage_class[&#39;reclaimPolicy&#39;] = &#39;Delete&#39;
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/provisioner-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/provisioner-secret-namespace&#39;] = namespace  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-publish-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-publish-secret-namespace&#39;] = namespace  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-stage-secret-name&#39;] = &#39;longhorn-crypto&#39;  # NOQA
+    storage_class[&#39;parameters&#39;][&#39;csi.storage.k8s.io/node-stage-secret-namespace&#39;] = namespace  # NOQA
+    create_storage_class(storage_class)
+
+    # Create deployment with PVC
+    pvc_name = &#39;pvc-deployment-with-encrypted-rwx-volume&#39;
+    pvc[&#39;metadata&#39;][&#39;name&#39;] = pvc_name
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = storage_class[&#39;metadata&#39;][&#39;name&#39;]
+    pvc[&#39;spec&#39;][&#39;accessModes&#39;] = [&#39;ReadWriteMany&#39;]
+
+    core_api.create_namespaced_persistent_volume_claim(
+        body=pvc, namespace=&#39;default&#39;)
+
+    deployment = make_deployment_with_pvc(
+        &#39;pvc-deployment-with-encrypted-rwx-volume&#39;, pvc_name, replicas=3)
+
+    apps_api = get_apps_api_client()
+    create_and_wait_deployment(apps_api, deployment)
+
+    # Clean up deployment and volume
+    delete_and_wait_deployment(apps_api, deployment[&#34;metadata&#34;][&#34;name&#34;])
+    delete_and_wait_pvc(core_api, pvc_name)</code></pre>
+</details>
+</dd>
 <dt id="tests.test_rwx.test_restore_rwo_volume_to_rwx"><code class="name flex">
 <span>def <span class="ident">test_restore_rwo_volume_to_rwx</span></span>(<span>set_random_backupstore, client, core_api, volume_name, pvc, csi_pv, pod_make, make_deployment_with_pvc)</span>
 </code></dt>
@@ -875,6 +1107,176 @@ volume.</li>
         core_api, command1, share_manager_name, LONGHORN_NAMESPACE)
     assert test_data_2 == exec_command_in_pod(
         core_api, command2, share_manager_name, LONGHORN_NAMESPACE)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_rwx.test_rwx_offline_expansion"><code class="name flex">
+<span>def <span class="ident">test_rwx_offline_expansion</span></span>(<span>client, core_api, pvc, make_deployment_with_pvc)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Related issue :
+<a href="https://github.com/longhorn/longhorn/issues/2181">https://github.com/longhorn/longhorn/issues/2181</a>
+<a href="https://github.com/longhorn/longhorn/issues/2484">https://github.com/longhorn/longhorn/issues/2484</a></p>
+<p>This test case does not cover the UI test mentioned in the related issue's
+test steps."</p>
+<p>Given
+- Create a rwx pvc using longhorn storage class of size 1 Gi.</p>
+<p>And
+- Atach it to a workload (deployment) and write some data.
+- Scale down the workload, wait volume detached
+- Share manager pod will terminate automatically
+- Expand the volume to 4 Gi, wait exoansion complete</p>
+<p>When
+- Scale up workload</p>
+<p>Then
+- Share manager pod created
+- Volume healthy</p>
+<p>And
+- 1.5 Gi of data is successfully written to the expanded volume</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def test_rwx_offline_expansion(client, core_api, pvc, make_deployment_with_pvc): # NOQA
+    &#34;&#34;&#34;
+    Related issue :
+    https://github.com/longhorn/longhorn/issues/2181
+    https://github.com/longhorn/longhorn/issues/2484
+
+    This test case does not cover the UI test mentioned in the related issue&#39;s
+    test steps.&#34;
+
+    Given
+    - Create a rwx pvc using longhorn storage class of size 1 Gi.
+
+    And
+    - Atach it to a workload (deployment) and write some data.
+    - Scale down the workload, wait volume detached
+    - Share manager pod will terminate automatically
+    - Expand the volume to 4 Gi, wait exoansion complete
+
+    When
+    - Scale up workload
+
+    Then
+    - Share manager pod created
+    - Volume healthy
+
+    And
+    - 1.5 Gi of data is successfully written to the expanded volume
+    &#34;&#34;&#34;
+    pvc_name = &#39;pvc-deployment-rwx-expand-test&#39;
+    pvc[&#39;metadata&#39;][&#39;name&#39;] = pvc_name
+    pvc[&#39;spec&#39;][&#39;storageClassName&#39;] = &#39;longhorn&#39;
+    pvc[&#39;spec&#39;][&#39;accessModes&#39;] = [&#39;ReadWriteMany&#39;]
+    pvc[&#39;spec&#39;][&#39;resources&#39;][&#39;requests&#39;][&#39;storage&#39;] = str(1 * Gi)
+
+    core_api.create_namespaced_persistent_volume_claim(
+        body=pvc, namespace=&#39;default&#39;)
+
+    deployment = make_deployment_with_pvc(
+        &#39;deployment-rwx-expand-test&#39;, pvc_name, replicas=1)
+    apps_api = get_apps_api_client()
+    create_and_wait_deployment(apps_api, deployment)
+
+    pv_name = get_volume_name(core_api, pvc_name)
+    deployment_label_selector = &#34;name=&#34; + \
+                                deployment[&#34;metadata&#34;][&#34;labels&#34;][&#34;name&#34;]
+
+    deployment_pod_list = \
+        core_api.list_namespaced_pod(namespace=&#34;default&#34;,
+                                     label_selector=deployment_label_selector)
+
+    pod_name = deployment_pod_list.items[0].metadata.name
+    test_data = generate_random_data(VOLUME_RWTEST_SIZE)
+    write_pod_volume_data(core_api, pod_name, test_data, filename=&#39;test&#39;)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 0
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment[&#34;metadata&#34;][&#34;name&#34;])
+
+    wait_for_volume_detached(client, pv_name)
+    expand_and_wait_for_pvc(core_api, pvc, EXPANDED_VOLUME_SIZE*Gi)
+    wait_for_volume_expansion(client, pv_name)
+    wait_for_volume_detached(client, pv_name)
+
+    deployment[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    apps_api.patch_namespaced_deployment(body=deployment,
+                                         namespace=&#39;default&#39;,
+                                         name=deployment[&#34;metadata&#34;][&#34;name&#34;])
+    wait_deployment_replica_ready(apps_api, deployment[&#34;metadata&#34;][&#34;name&#34;], 1)
+    wait_for_volume_healthy(client, pv_name)
+
+    deployment_pod_list = \
+        core_api.list_namespaced_pod(namespace=&#34;default&#34;,
+                                     label_selector=deployment_label_selector)
+    pod_name = deployment_pod_list.items[0].metadata.name
+
+    # check data written before expansion
+    resp = read_volume_data(core_api, pod_name, &#34;test&#34;)
+    assert resp == test_data
+
+    data_size_in_mb = 1536
+    write_pod_volume_random_data(core_api, pod_name, &#34;/data/test2&#34;,
+                                 data_size_in_mb)
+    command = &#39;stat -c \&#34;%s\&#34; /data/test2&#39;
+    data_size_in_pod = exec_command_in_pod(core_api, command,
+                                           pod_name,
+                                           &#39;default&#39;)
+    assert int(data_size_in_pod)/1024/1024 == data_size_in_mb</code></pre>
+</details>
+</dd>
+<dt id="tests.test_rwx.test_rwx_onine_expansion"><code class="name flex">
+<span>def <span class="ident">test_rwx_onine_expansion</span></span>(<span>)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Related issue :
+<a href="https://github.com/longhorn/longhorn/issues/2181">https://github.com/longhorn/longhorn/issues/2181</a>
+<a href="https://github.com/longhorn/longhorn/issues/2484">https://github.com/longhorn/longhorn/issues/2484</a></p>
+<p>This test case does not cover the UI test mentioned in the related issue's
+test steps."</p>
+<p>Given
+- Create a rwx pvc using longhorn storage class of size 1 Gi.</p>
+<p>And
+- Atach it to a workload (deployment) and write some data.</p>
+<p>When
+- Expand the volume to 5 Gi</p>
+<p>Then
+- Expansion of volume is completed.
+- Share manager pod not restart</p>
+<p>And
+- 1.5 Gi of data is successfully written to the expanded volume.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">@pytest.mark.skip(reason=&#34;TODO&#34;)
+def test_rwx_onine_expansion(): # NOQA
+    &#34;&#34;&#34;
+    Related issue :
+    https://github.com/longhorn/longhorn/issues/2181
+    https://github.com/longhorn/longhorn/issues/2484
+
+    This test case does not cover the UI test mentioned in the related issue&#39;s
+    test steps.&#34;
+
+    Given
+    - Create a rwx pvc using longhorn storage class of size 1 Gi.
+
+    And
+    - Atach it to a workload (deployment) and write some data.
+
+    When
+    - Expand the volume to 5 Gi
+
+    Then
+    - Expansion of volume is completed.
+    - Share manager pod not restart
+
+    And
+    - 1.5 Gi of data is successfully written to the expanded volume.
+    &#34;&#34;&#34;
+    pass</code></pre>
 </details>
 </dd>
 <dt id="tests.test_rwx.test_rwx_parallel_writing"><code class="name flex">
@@ -1211,10 +1613,13 @@ path <code>/export</code></li>
 </li>
 <li><h3><a href="#header-functions">Functions</a></h3>
 <ul class="">
+<li><code><a title="tests.test_rwx.test_encrypted_rwx_volume" href="#tests.test_rwx.test_encrypted_rwx_volume">test_encrypted_rwx_volume</a></code></li>
 <li><code><a title="tests.test_rwx.test_restore_rwo_volume_to_rwx" href="#tests.test_rwx.test_restore_rwo_volume_to_rwx">test_restore_rwo_volume_to_rwx</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_delete_share_manager_pod" href="#tests.test_rwx.test_rwx_delete_share_manager_pod">test_rwx_delete_share_manager_pod</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_deployment_with_multi_pods" href="#tests.test_rwx.test_rwx_deployment_with_multi_pods">test_rwx_deployment_with_multi_pods</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_multi_statefulset_with_same_pvc" href="#tests.test_rwx.test_rwx_multi_statefulset_with_same_pvc">test_rwx_multi_statefulset_with_same_pvc</a></code></li>
+<li><code><a title="tests.test_rwx.test_rwx_offline_expansion" href="#tests.test_rwx.test_rwx_offline_expansion">test_rwx_offline_expansion</a></code></li>
+<li><code><a title="tests.test_rwx.test_rwx_onine_expansion" href="#tests.test_rwx.test_rwx_onine_expansion">test_rwx_onine_expansion</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_parallel_writing" href="#tests.test_rwx.test_rwx_parallel_writing">test_rwx_parallel_writing</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_statefulset_scale_down_up" href="#tests.test_rwx.test_rwx_statefulset_scale_down_up">test_rwx_statefulset_scale_down_up</a></code></li>
 <li><code><a title="tests.test_rwx.test_rwx_with_statefulset_multi_pods" href="#tests.test_rwx.test_rwx_with_statefulset_multi_pods">test_rwx_with_statefulset_multi_pods</a></code></li>

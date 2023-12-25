@@ -55,6 +55,10 @@ from common import delete_backup
 from common import create_and_check_volume, create_pvc, \
     wait_and_get_pv_for_pvc, wait_delete_pvc
 from common import volume_name # NOQA
+from common import update_setting
+from common import SETTING_DEGRADED_AVAILABILITY
+from common import wait_statefulset, crash_engine_process_with_sigkill
+
 from backupstore import backupstore_cleanup
 
 from kubernetes import client as k8sclient
@@ -255,24 +259,8 @@ def test_kubernetes_status(client, core_api, storage_class,  # NOQA
         ks_list[i][&#39;lastPVCRefAt&#39;] = &#39;&#39;
         if i == 0:
             ks_list[i][&#39;lastPodRefAt&#39;] = &#39;not empty&#39;
-            ks_list[i][&#39;workloadsStatus&#39;] = [
-                {
-                    &#39;podName&#39;: p[&#39;pod_name&#39;],
-                    &#39;podStatus&#39;: &#39;Running&#39;,
-                    &#39;workloadName&#39;: statefulset_name,
-                    &#39;workloadType&#39;: &#39;StatefulSet&#39;,
-                },
-            ]
         if i == 1:
             ks_list[i][&#39;lastPodRefAt&#39;] = &#39;&#39;
-            ks_list[i][&#39;workloadsStatus&#39;] = [
-                {
-                    &#39;podName&#39;: extra_pod_name,
-                    &#39;podStatus&#39;: &#39;Running&#39;,
-                    &#39;workloadName&#39;: &#39;&#39;,
-                    &#39;workloadType&#39;: &#39;&#39;,
-                }
-            ]
         wait_volume_kubernetes_status(client, volume_name, ks_list[i])
 
     # deleted extra_pod, all volumes have no workload
@@ -569,6 +557,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         1. Make sure `lastPodRefAt` and `lastPVCRefAt` matched volume on step
         12
     &#34;&#34;&#34;
+    update_setting(client, SETTING_DEGRADED_AVAILABILITY, &#34;false&#34;)
 
     host_id = get_self_host_id()
     static_sc_name = &#34;longhorn-static-test&#34;
@@ -687,13 +676,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         &#39;namespace&#39;: &#39;default&#39;,
         &#39;pvcName&#39;: pvc_name,
         &#39;pvName&#39;: &#39;&#39;,
-        &#39;pvStatus&#39;: &#39;&#39;,
-        &#39;workloadsStatus&#39;: [{
-            &#39;podName&#39;: pod_name,
-            &#39;podStatus&#39;: &#39;Running&#39;,
-            &#39;workloadName&#39;: &#39;&#39;,
-            &#39;workloadType&#39;: &#39;&#39;
-        }]
+        &#39;pvStatus&#39;: &#39;&#39;
     }
     wait_volume_kubernetes_status(client, volume_name, ks)
     volume = wait_for_volume_detached(client, volume_name)
@@ -715,12 +698,6 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
     assert status[&#39;pvcName&#39;] == pvc_name
     assert status[&#39;pvName&#39;] == &#34;&#34;
     assert status[&#39;pvStatus&#39;] == &#34;&#34;
-    assert status[&#39;workloadsStatus&#39;] == [{
-        &#39;podName&#39;: pod_name,
-        &#39;podStatus&#39;: &#39;Running&#39;,
-        &#39;workloadName&#39;: &#39;&#39;,
-        &#39;workloadType&#39;: &#39;&#39;
-    }]
 
     restore_name = generate_volume_name()
     client.create_volume(name=restore_name, size=SIZE,
@@ -735,13 +712,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         &#39;namespace&#39;: &#39;default&#39;,
         &#39;pvcName&#39;: pvc_name,
         &#39;pvName&#39;: &#39;&#39;,
-        &#39;pvStatus&#39;: &#39;&#39;,
-        &#39;workloadsStatus&#39;: [{
-            &#39;podName&#39;: pod_name,
-            &#39;podStatus&#39;: &#39;Running&#39;,
-            &#39;workloadName&#39;: &#39;&#39;,
-            &#39;workloadType&#39;: &#39;&#39;
-        }]
+        &#39;pvStatus&#39;: &#39;&#39;
     }
     wait_volume_kubernetes_status(client, restore_name, ks)
     restore = client.by_id_volume(restore_name)
@@ -838,7 +809,47 @@ def test_delete_provisioned_pvc(client, core_api,  storage_class, pvc): # NOQA
 
     delete_and_wait_pvc(core_api, pvc[&#39;metadata&#39;][&#39;name&#39;])
     wait_delete_pv(core_api, pv_name)
-    wait_for_volume_delete(client, volume_name)</code></pre>
+    wait_for_volume_delete(client, volume_name)
+
+
+@pytest.mark.csi  # NOQA
+def test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly(client, core_api, statefulset, storage_class):  # NOQA
+    &#34;&#34;&#34;
+    Test CSI umount when Longhorn block device is disconnected unexpectedly
+
+    GitHub ticket: https://github.com/longhorn/longhorn/issues/3778
+
+    1. Deloy a statefulset that has volumeClaimTemplates with
+        volumeMode: Block
+    2. Crash the engine process of the volume to simulate Longhorn block
+        device is disconnected unexpectedly
+    3. Delete the workload pod
+    4. Verify that the pod is able to terminated and a new pod is able
+        start
+    &#34;&#34;&#34;
+    device_path = &#34;/dev/longhorn/longhorn-test-blk&#34;
+    statefulset[&#39;spec&#39;][&#39;template&#39;][&#39;spec&#39;][&#39;containers&#39;][0][&#39;volumeMounts&#39;] = [] # NOQA
+    statefulset[&#39;spec&#39;][&#39;template&#39;][&#39;spec&#39;][&#39;containers&#39;][0][&#39;volumeDevices&#39;] = [ # NOQA
+        {&#39;name&#39;: &#39;pod-data&#39;, &#39;devicePath&#39;: device_path}
+    ]
+    statefulset[&#39;spec&#39;][&#39;volumeClaimTemplates&#39;][0][&#39;spec&#39;][&#39;volumeMode&#39;] = &#39;Block&#39; # NOQA
+    statefulset[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    statefulset_name = &#39;block-device-disconnect-unexpectedly-test&#39;
+    update_statefulset_manifests(statefulset,
+                                 storage_class,
+                                 statefulset_name)
+
+    create_storage_class(storage_class)
+    create_and_wait_statefulset(statefulset)
+    sspod_info = get_statefulset_pod_info(core_api, statefulset)[0]
+
+    crash_engine_process_with_sigkill(client, core_api,
+                                      sspod_info[&#39;pv_name&#39;])
+    delete_and_wait_pod(core_api,
+                        pod_name=sspod_info[&#39;pod_name&#39;],
+                        wait=False)
+
+    wait_statefulset(statefulset)</code></pre>
 </details>
 </section>
 <section>
@@ -999,6 +1010,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         1. Make sure `lastPodRefAt` and `lastPVCRefAt` matched volume on step
         12
     &#34;&#34;&#34;
+    update_setting(client, SETTING_DEGRADED_AVAILABILITY, &#34;false&#34;)
 
     host_id = get_self_host_id()
     static_sc_name = &#34;longhorn-static-test&#34;
@@ -1117,13 +1129,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         &#39;namespace&#39;: &#39;default&#39;,
         &#39;pvcName&#39;: pvc_name,
         &#39;pvName&#39;: &#39;&#39;,
-        &#39;pvStatus&#39;: &#39;&#39;,
-        &#39;workloadsStatus&#39;: [{
-            &#39;podName&#39;: pod_name,
-            &#39;podStatus&#39;: &#39;Running&#39;,
-            &#39;workloadName&#39;: &#39;&#39;,
-            &#39;workloadType&#39;: &#39;&#39;
-        }]
+        &#39;pvStatus&#39;: &#39;&#39;
     }
     wait_volume_kubernetes_status(client, volume_name, ks)
     volume = wait_for_volume_detached(client, volume_name)
@@ -1145,12 +1151,6 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
     assert status[&#39;pvcName&#39;] == pvc_name
     assert status[&#39;pvName&#39;] == &#34;&#34;
     assert status[&#39;pvStatus&#39;] == &#34;&#34;
-    assert status[&#39;workloadsStatus&#39;] == [{
-        &#39;podName&#39;: pod_name,
-        &#39;podStatus&#39;: &#39;Running&#39;,
-        &#39;workloadName&#39;: &#39;&#39;,
-        &#39;workloadType&#39;: &#39;&#39;
-    }]
 
     restore_name = generate_volume_name()
     client.create_volume(name=restore_name, size=SIZE,
@@ -1165,13 +1165,7 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
         &#39;namespace&#39;: &#39;default&#39;,
         &#39;pvcName&#39;: pvc_name,
         &#39;pvName&#39;: &#39;&#39;,
-        &#39;pvStatus&#39;: &#39;&#39;,
-        &#39;workloadsStatus&#39;: [{
-            &#39;podName&#39;: pod_name,
-            &#39;podStatus&#39;: &#39;Running&#39;,
-            &#39;workloadName&#39;: &#39;&#39;,
-            &#39;workloadType&#39;: &#39;&#39;
-        }]
+        &#39;pvStatus&#39;: &#39;&#39;
     }
     wait_volume_kubernetes_status(client, restore_name, ks)
     restore = client.by_id_volume(restore_name)
@@ -1182,6 +1176,65 @@ def test_backup_kubernetes_status(set_random_backupstore, client, core_api, pod)
     backupstore_cleanup(client)
     client.delete(restore)
     cleanup_volume(client, volume)</code></pre>
+</details>
+</dd>
+<dt id="tests.test_kubernetes.test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly"><code class="name flex">
+<span>def <span class="ident">test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly</span></span>(<span>client, core_api, statefulset, storage_class)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Test CSI umount when Longhorn block device is disconnected unexpectedly</p>
+<p>GitHub ticket: <a href="https://github.com/longhorn/longhorn/issues/3778">https://github.com/longhorn/longhorn/issues/3778</a></p>
+<ol>
+<li>Deloy a statefulset that has volumeClaimTemplates with
+volumeMode: Block</li>
+<li>Crash the engine process of the volume to simulate Longhorn block
+device is disconnected unexpectedly</li>
+<li>Delete the workload pod</li>
+<li>Verify that the pod is able to terminated and a new pod is able
+start</li>
+</ol></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">@pytest.mark.csi  # NOQA
+def test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly(client, core_api, statefulset, storage_class):  # NOQA
+    &#34;&#34;&#34;
+    Test CSI umount when Longhorn block device is disconnected unexpectedly
+
+    GitHub ticket: https://github.com/longhorn/longhorn/issues/3778
+
+    1. Deloy a statefulset that has volumeClaimTemplates with
+        volumeMode: Block
+    2. Crash the engine process of the volume to simulate Longhorn block
+        device is disconnected unexpectedly
+    3. Delete the workload pod
+    4. Verify that the pod is able to terminated and a new pod is able
+        start
+    &#34;&#34;&#34;
+    device_path = &#34;/dev/longhorn/longhorn-test-blk&#34;
+    statefulset[&#39;spec&#39;][&#39;template&#39;][&#39;spec&#39;][&#39;containers&#39;][0][&#39;volumeMounts&#39;] = [] # NOQA
+    statefulset[&#39;spec&#39;][&#39;template&#39;][&#39;spec&#39;][&#39;containers&#39;][0][&#39;volumeDevices&#39;] = [ # NOQA
+        {&#39;name&#39;: &#39;pod-data&#39;, &#39;devicePath&#39;: device_path}
+    ]
+    statefulset[&#39;spec&#39;][&#39;volumeClaimTemplates&#39;][0][&#39;spec&#39;][&#39;volumeMode&#39;] = &#39;Block&#39; # NOQA
+    statefulset[&#39;spec&#39;][&#39;replicas&#39;] = 1
+    statefulset_name = &#39;block-device-disconnect-unexpectedly-test&#39;
+    update_statefulset_manifests(statefulset,
+                                 storage_class,
+                                 statefulset_name)
+
+    create_storage_class(storage_class)
+    create_and_wait_statefulset(statefulset)
+    sspod_info = get_statefulset_pod_info(core_api, statefulset)[0]
+
+    crash_engine_process_with_sigkill(client, core_api,
+                                      sspod_info[&#39;pv_name&#39;])
+    delete_and_wait_pod(core_api,
+                        pod_name=sspod_info[&#39;pod_name&#39;],
+                        wait=False)
+
+    wait_statefulset(statefulset)</code></pre>
 </details>
 </dd>
 <dt id="tests.test_kubernetes.test_delete_provisioned_pvc"><code class="name flex">
@@ -1509,24 +1562,8 @@ def test_kubernetes_status(client, core_api, storage_class,  # NOQA
         ks_list[i][&#39;lastPVCRefAt&#39;] = &#39;&#39;
         if i == 0:
             ks_list[i][&#39;lastPodRefAt&#39;] = &#39;not empty&#39;
-            ks_list[i][&#39;workloadsStatus&#39;] = [
-                {
-                    &#39;podName&#39;: p[&#39;pod_name&#39;],
-                    &#39;podStatus&#39;: &#39;Running&#39;,
-                    &#39;workloadName&#39;: statefulset_name,
-                    &#39;workloadType&#39;: &#39;StatefulSet&#39;,
-                },
-            ]
         if i == 1:
             ks_list[i][&#39;lastPodRefAt&#39;] = &#39;&#39;
-            ks_list[i][&#39;workloadsStatus&#39;] = [
-                {
-                    &#39;podName&#39;: extra_pod_name,
-                    &#39;podStatus&#39;: &#39;Running&#39;,
-                    &#39;workloadName&#39;: &#39;&#39;,
-                    &#39;workloadType&#39;: &#39;&#39;,
-                }
-            ]
         wait_volume_kubernetes_status(client, volume_name, ks_list[i])
 
     # deleted extra_pod, all volumes have no workload
@@ -1863,6 +1900,7 @@ def test_pvc_creation_with_default_sc_set(
 <li><code><a title="tests.test_kubernetes.delete_and_wait_statefulset_only" href="#tests.test_kubernetes.delete_and_wait_statefulset_only">delete_and_wait_statefulset_only</a></code></li>
 <li><code><a title="tests.test_kubernetes.provision_and_wait_pv" href="#tests.test_kubernetes.provision_and_wait_pv">provision_and_wait_pv</a></code></li>
 <li><code><a title="tests.test_kubernetes.test_backup_kubernetes_status" href="#tests.test_kubernetes.test_backup_kubernetes_status">test_backup_kubernetes_status</a></code></li>
+<li><code><a title="tests.test_kubernetes.test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly" href="#tests.test_kubernetes.test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly">test_csi_umount_when_longhorn_block_device_is_disconnected_unexpectedly</a></code></li>
 <li><code><a title="tests.test_kubernetes.test_delete_provisioned_pvc" href="#tests.test_kubernetes.test_delete_provisioned_pvc">test_delete_provisioned_pvc</a></code></li>
 <li><code><a title="tests.test_kubernetes.test_delete_with_provisioned_pv" href="#tests.test_kubernetes.test_delete_with_provisioned_pv">test_delete_with_provisioned_pv</a></code></li>
 <li><code><a title="tests.test_kubernetes.test_delete_with_static_pv" href="#tests.test_kubernetes.test_delete_with_static_pv">test_delete_with_static_pv</a></code></li>
