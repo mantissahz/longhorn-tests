@@ -397,7 +397,7 @@
       <link>https://longhorn.github.io/longhorn-tests/manual/pre-release/resiliency/pvc_provisioning_with_insufficient_storage/</link>
       <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
       <guid>https://longhorn.github.io/longhorn-tests/manual/pre-release/resiliency/pvc_provisioning_with_insufficient_storage/</guid>
-      <description>Related Issue: https://github.com/longhorn/longhorn/issues/4654 https://github.com/longhorn/longhorn/issues/3529 Root Cause Analysis https://github.com/longhorn/longhorn/issues/4654#issuecomment-1264870672 This case need to be tested on both RWO/RWX volumes&#xA;Create a PVC with size larger than 8589934591 GiB. Deployment keep in pending status, RWO/RWX volume will keep in a create -&amp;gt; delete loop. Create a PVC with size &amp;lt;= 8589934591 GiB, but greater than the actual available space size. RWO/RWX volume will be created, and volume will have annotation &amp;ldquo;longhorn.io/volume-scheduling-error&amp;rdquo;: &amp;ldquo;insufficient storage volume scheduling failure&amp;rdquo; in it.</description>
+      <description>Related Issue: https://github.com/longhorn/longhorn/issues/4654 https://github.com/longhorn/longhorn/issues/3529 https://github.com/longhorn/longhorn/issues/6461 Root Cause Analysis https://github.com/longhorn/longhorn/issues/4654#issuecomment-1264870672 This case need to be tested on both RWO/RWX volumes&#xA;Create a PVC with size larger than 8589934591 GiB. Deployment keep in pending status, RWO/RWX volume will keep in a create -&amp;gt; delete loop. Create a PVC with size &amp;lt;= 8589934591 GiB, but greater than the actual available space size. RWO/RWX volume will be created, and the associated PV for this volume will have annotation &amp;ldquo;longhorn.</description>
     </item>
     <item>
       <title>Re-deploy CSI components when their images change</title>
@@ -1014,6 +1014,13 @@
       <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
       <guid>https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.0.0/suse-sles12sp3/xfs-after-custom-fs-params/</guid>
       <description> create a volume + pv + pvc with filesystem xfs named xfs-ignores create a deployment that uses xfs-ignores verify that the pod enters running state and the volume is accessible </description>
+    </item>
+    <item>
+      <title>ui sanity check</title>
+      <link>https://longhorn.github.io/longhorn-tests/manual/pre-release/ui/ui-sanity-check/</link>
+      <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
+      <guid>https://longhorn.github.io/longhorn-tests/manual/pre-release/ui/ui-sanity-check/</guid>
+      <description>Access Longhorn UI on Chrome, Firefox and Safari latest/stable version. Check the pages. All the text, form, tables should be proper. Verify all the links at the bottom, they shouldn&amp;rsquo;t be broken and redirects to right pages. Check the setting page, all the settings&amp;rsquo;s text, values should be proper. Create Backing Image, volume, pv, pvc and recurring jobs using UI. Take volume snapshot, create volume backup, and system backup using UI.</description>
     </item>
     <item>
       <title>Uninstallation Checks</title>
