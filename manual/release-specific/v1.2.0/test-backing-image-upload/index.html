@@ -104,6 +104,9 @@
 
   
 
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node/degraded-availability/">Degraded availability with added nodes</a></li>
+  
+
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/environment/">Environment</a></li>
   
     <ul>
@@ -142,6 +145,9 @@
 
 </ul>
 
+  
+
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node/improve-node-failure-handling/">Improve Node Failure Handling By Automatically Force Delete Terminating Pods of StatefulSet/Deployment On Downed Node</a></li>
   
 
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/managed-kubernetes-clusters/">Managed Kubernetes Clusters (EKS, GKE, AKS)</a></li>
@@ -854,7 +860,7 @@
 <li>Create a valid backing image</li>
 <li>Create a StorageClass, which use the same backing image name but different data source type/parameters.</li>
 <li>Create a PVC with the StorageClass.
-==&gt; The corresponding creation should fail. The longhorn-csi-plugin will repeatly print out error logs like this <code>existing backing image %v data source is different from the parameters in the creation request or StorageClass</code>.</li>
+==&gt; The corresponding creation should fail. The longhorn-csi-plugin will repeatedly print out error logs like this <code>existing backing image %v data source is different from the parameters in the creation request or StorageClass</code>.</li>
 <li>Delete the PVC and the StorageClass.</li>
 <li>Recreate a StorageClass in which the backing image fields match the existing backing image.</li>
 <li>Create a PVC with the StorageClass.
