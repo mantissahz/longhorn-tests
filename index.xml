@@ -12,7 +12,7 @@
       <link>https://longhorn.github.io/longhorn-tests/integration/</link>
       <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
       <guid>https://longhorn.github.io/longhorn-tests/integration/</guid>
-      <description>&lt;!doctype html&gt; tests API documentation Namespace tests Sub-modules tests.aws tests.backupstore tests.cloudprovider tests.common tests.conftest tests.digitalocean tests.longhorn tests.node tests.test_backing_image tests.test_basic tests.test_cloning tests.test_cluster_autoscaler tests.test_csi tests.test_csi_snapshotter tests.test_engine_upgrade tests.test_ha tests.test_infra tests.test_kubernetes tests.test_metric tests.test_migration tests.test_node tests.test_orphan tests.test_provisioner tests.test_recurring_job tests.test_rwx tests.test_scheduling tests.test_settings tests.test_snapshot tests.test_statefulset tests.test_stress tests.test_support_bundle tests.test_system_backup_restore tests.test_tagging tests.test_upgrade tests.test_zone Index Sub-modules tests.aws tests.backupstore tests.cloudprovider tests.common tests.conftest tests.digitalocean tests.longhorn tests.node tests.test_backing_image tests.test_basic tests.test_cloning tests.test_cluster_autoscaler tests.test_csi tests.test_csi_snapshotter tests.test_engine_upgrade tests.test_ha tests.test_infra tests.test_kubernetes tests.test_metric tests.test_migration tests.test_node tests.test_orphan tests.test_provisioner tests.test_recurring_job tests.test_rwx tests.</description>
+      <description>&lt;!doctype html&gt; tests API documentation Namespace tests Sub-modules tests.aws tests.backupstore tests.cloudprovider tests.common tests.conftest tests.digitalocean tests.longhorn tests.node tests.test_backing_image tests.test_basic tests.test_cloning tests.test_cluster_autoscaler tests.test_csi tests.test_csi_snapshotter tests.test_engine_upgrade tests.test_ha tests.test_infra tests.test_kubernetes tests.test_metric tests.test_migration tests.test_node tests.test_orphan tests.test_provisioner tests.test_recurring_job tests.test_rwx tests.test_scheduling tests.test_settings tests.test_snapshot tests.test_statefulset tests.test_stress tests.test_support_bundle tests.test_system_backup_restore tests.test_tagging tests.test_upgrade tests.test_zone Sub-modules tests.aws tests.backupstore tests.cloudprovider tests.common tests.conftest tests.digitalocean tests.longhorn tests.node tests.test_backing_image tests.test_basic tests.test_cloning tests.test_cluster_autoscaler tests.test_csi tests.test_csi_snapshotter tests.test_engine_upgrade tests.test_ha tests.test_infra tests.test_kubernetes tests.test_metric tests.test_migration tests.test_node tests.test_orphan tests.test_provisioner tests.test_recurring_job tests.test_rwx tests.test_scheduling tests.</description>
     </item>
     <item>
       <title></title>
@@ -369,7 +369,7 @@
       <link>https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/node-disconnection/</link>
       <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
       <guid>https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/node-disconnection/</guid>
-      <description>https://github.com/longhorn/longhorn/issues/1545 For disconnect node : https://github.com/longhorn/longhorn/files/4864127/network_down.sh.zip&#xA;If auto-salvage is disabled, the auto-reattachment behavior after the node disconnection depends on all replicas are in ERROR state or not.&#xA;(1) If all replicas are in ERROR state, the volume would remain in detached/faulted state if auto-salvage is disabled.&#xA;(2) If there is any healthy replica, the volume would be auto-reattached even though auto-salvage is disabled.&#xA;What makes all replicas in ERROR state? When there is data writing during the disconnection:</description>
+      <description>https://github.com/longhorn/longhorn/issues/1545 For disconnect node : https://github.com/longhorn/longhorn/files/4864127/network_down.sh.zip&#xA;If auto-salvage is disabled, the behavior after the node disconnection depends on all replicas are in ERROR state or not.&#xA;(1) If all replicas are in ERROR state, the volume would remain in detached/faulted state if auto-salvage is disabled.&#xA;(2) If there is any healthy replica, the volume would start the replica rebuild process(if necessary) after node back.&#xA;What makes all replicas in ERROR state?</description>
     </item>
     <item>
       <title>Node drain and deletion test</title>
@@ -390,7 +390,7 @@
       <link>https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/physical-node-reboot/</link>
       <pubDate>Mon, 01 Jan 0001 00:00:00 +0000</pubDate>
       <guid>https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/physical-node-reboot/</guid>
-      <description> Reboot the node that the controller (StatefulSet/Deployment) attached to. After reboot complete, the volume should be reattached to the node. </description>
+      <description> Create StatefulSet/Deployment with 3 a replicas volume. Reboot the volume node that the controller (StatefulSet/Deployment) attached to. After the reboot is complete, the volume should be healthy and the data should be correct. </description>
     </item>
     <item>
       <title>Priority Class Default Setting</title>
