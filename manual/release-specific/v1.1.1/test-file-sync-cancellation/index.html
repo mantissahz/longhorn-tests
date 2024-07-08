@@ -21,28 +21,28 @@
   
     <ul>
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/deployment/"> Deployment of Longhorn </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/deployment/"> Deployment of Longhorn  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/ui/"> UI </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/ui/">UI  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/volume/"> Volume </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/volume/">Volume  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/kubernetes/"> Kubernetes </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/kubernetes/">Kubernetes  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/backup/"> Backup </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/backup/">Backup  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/node/"> Node </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/node/">Node  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/scheduling/"> Scheduling </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/scheduling/">Scheduling  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/upgrade/"> Upgrade </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/upgrade/">Upgrade  </a></li>
   
 
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/monitoring/">Monitoring</a></li>
@@ -140,9 +140,6 @@
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/ha/ha-volume-migration/">HA Volume Migration</a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/ha/replica-rebuilding/">Replica Rebuilding</a></li>
-  
-
 </ul>
 
   
@@ -229,17 +226,6 @@
 
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/">Node Disconnection</a></li>
-  
-    <ul>
-
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/node-disconnection/">Node disconnection test</a></li>
-  
-
-</ul>
-
-  
-
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-down/">Node Down</a></li>
   
     <ul>
@@ -268,9 +254,6 @@
     <ul>
 
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/dr-volume-node-rebooted/">#1366 &amp;&amp; #1328 The node the DR volume attached to is rebooted</a></li>
-  
-
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/physical-node-reboot/">Physical node reboot</a></li>
   
 
 </ul>
@@ -788,6 +771,9 @@
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-gke-container-optimized-os-dependency-setup/">Dependency setup for GKE cluster using Container-Optimized OS as base image</a></li>
   
 
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-node-disk-support/">Node Disk Support</a></li>
+  
+
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-kubelet-restart-no-pending-pod-event/">restarting Kubelet should not result in repeated &ldquo;no Pending workload pods &hellip;&rdquo; event for the workload pod.</a></li>
   
 
@@ -874,7 +860,7 @@ spec:
 </code></pre><ol start="2">
 <li>Download a backing image in the first pod:</li>
 </ol>
-<pre tabindex="0"><code># alias bm=&#34;backing-image-manager backing-image&#34;
+<pre tabindex="0"><code># alias bm=&quot;backing-image-manager backing-image&quot;
 # bm pull --name bi-test --uuid uuid-bi-test --download-url https://cloud-images.ubuntu.com/minimal/releases/focal/release-20200729/ubuntu-20.04-minimal-cloudimg-amd64.img
 # bm ls
 </code></pre><ol start="3">
@@ -885,7 +871,7 @@ tc qdisc add dev eth0 root tbf rate 500kbit latency 0.1ms burst 1000kbit
 </code></pre><ol start="4">
 <li>Then start to get the backing image file from the 1st BIM pod</li>
 </ol>
-<pre tabindex="0"><code># alias bm=&#34;backing-image-manager backing-image&#34;
+<pre tabindex="0"><code># alias bm=&quot;backing-image-manager backing-image&quot;
 # bm sync --name bi-test --uuid uuid-bi-test --download-url https://cloud-images.ubuntu.com/minimal/releases/focal/release-20200729/ubuntu-20.04-minimal-cloudimg-amd64.img --size 208601088 --from-host &lt;the IP of 1st BIM pod&gt; --to-host &lt;the IP of 2nd BIM pod&gt;
 # bm ls
 </code></pre><ol start="5">

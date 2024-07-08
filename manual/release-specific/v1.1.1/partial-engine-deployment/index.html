@@ -21,28 +21,28 @@
   
     <ul>
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/deployment/"> Deployment of Longhorn </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/deployment/"> Deployment of Longhorn  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/ui/"> UI </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/ui/">UI  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/volume/"> Volume </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/volume/">Volume  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/kubernetes/"> Kubernetes </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/kubernetes/">Kubernetes  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/backup/"> Backup </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/backup/">Backup  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/node/"> Node </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/node/">Node  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/scheduling/"> Scheduling </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/scheduling/">Scheduling  </a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/upgrade/"> Upgrade </a></li>
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/upgrade/">Upgrade  </a></li>
   
 
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/functional-test-cases/monitoring/">Monitoring</a></li>
@@ -140,9 +140,6 @@
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/ha/ha-volume-migration/">HA Volume Migration</a></li>
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/ha/replica-rebuilding/">Replica Rebuilding</a></li>
-  
-
 </ul>
 
   
@@ -229,17 +226,6 @@
 
   
 
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/">Node Disconnection</a></li>
-  
-    <ul>
-
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-disconnection/node-disconnection/">Node disconnection test</a></li>
-  
-
-</ul>
-
-  
-
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-down/">Node Down</a></li>
   
     <ul>
@@ -268,9 +254,6 @@
     <ul>
 
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/dr-volume-node-rebooted/">#1366 &amp;&amp; #1328 The node the DR volume attached to is rebooted</a></li>
-  
-
-  <li><a href="https://longhorn.github.io/longhorn-tests/manual/pre-release/node-not-ready/node-restart/physical-node-reboot/">Physical node reboot</a></li>
   
 
 </ul>
@@ -788,6 +771,9 @@
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-gke-container-optimized-os-dependency-setup/">Dependency setup for GKE cluster using Container-Optimized OS as base image</a></li>
   
 
+  <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-node-disk-support/">Node Disk Support</a></li>
+  
+
   <li><a href="https://longhorn.github.io/longhorn-tests/manual/release-specific/v1.7.0/test-kubelet-restart-no-pending-pod-event/">restarting Kubelet should not result in repeated &ldquo;no Pending workload pods &hellip;&rdquo; event for the workload pod.</a></li>
   
 
@@ -873,8 +859,8 @@
 <p>With the engine image is missing on <code>node-1</code>, we need  to re-verify the manual test for feature <code>auto upgrade engine</code> <a href="https://github.com/longhorn/longhorn-tests/blob/master/docs/content/manual/pre-release/upgrade/auto-upgrade-engine.md">https://github.com/longhorn/longhorn-tests/blob/master/docs/content/manual/pre-release/upgrade/auto-upgrade-engine.md</a>
 Make sure that Longhorn automatically upgrades engine image for volumes that are either:</p>
 <ol>
-<li>in the detached state, and has the new engine image on all replicas&rsquo; node</li>
-<li>in the attached state, and has the new engine image on all replicas&rsquo; node and attaching node</li>
+<li>in the detached state, and has the new engine image on all replicas' node</li>
+<li>in the attached state, and has the new engine image on all replicas' node and attaching node</li>
 </ol>
 <h3 id="case-7-test-auto-attach-volume-for-recurring-backup-job-feature-when-some-of-the-engine-image-daemonset-pods-are-not-fully-deployed">Case 7: Test <code>auto attach volume for recurring backup job</code> feature when some of the engine image DaemonSet pods are not fully deployed</h3>
 <p>Verify that the recurring backup job only attaches the volume to a node that has the engine image deployed.</p>
