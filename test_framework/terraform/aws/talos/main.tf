@@ -12,9 +12,10 @@ terraform {
 }
 
 provider "aws" {
-  region = var.aws_region
+  region     = var.aws_region
   access_key = var.lh_aws_access_key
   secret_key = var.lh_aws_secret_key
+  token      = var.lh_aws_token
 }
 
 # Create a random string suffix for instance names
@@ -37,7 +38,7 @@ resource "aws_vpc" "lh_aws_vpc" {
 
 # Create security group
 resource "aws_security_group" "lh_aws_secgrp" {
-  name        = "lh_aws_secgrp"
+  name        = "lh_aws_jl_secgrp"
   description = "Allow all inbound traffic"
   vpc_id      = aws_vpc.lh_aws_vpc.id
 
@@ -57,8 +58,80 @@ resource "aws_security_group" "lh_aws_secgrp" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "SSH from anywhere"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "DNS (TCP)"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "DNS (UDP)"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SMB"
+    from_port   = 445
+    to_port     = 445
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "NFS"
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "ALL TCP"
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "ALL UDP"
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   tags = {
-    Name = "lh_aws_sec_grp-${random_string.random_suffix.id}"
+    Name = "lh_aws_jl_sec_grp-${random_string.random_suffix.id}"
     Owner = var.resources_owner
   }
 }
@@ -99,7 +172,7 @@ resource "aws_route_table" "lh_aws_rt" {
   }
 
   tags = {
-    Name = "lh_aws_rt-${random_string.random_suffix.id}"
+    Name = "lh_aws_jl_rt-${random_string.random_suffix.id}"
     Owner = var.resources_owner
   }
 }
@@ -137,33 +210,33 @@ resource "aws_instance" "lh_aws_instance_controlplane" {
   }
 }
 
-resource "aws_ebs_volume" "lh_aws_ssd_volume_v1" {
-
-  count = var.lh_aws_instance_count_worker
-
-  availability_zone = var.aws_availability_zone
-  size              = var.block_device_size_worker
-  type              = "gp2"
-
-  tags = {
-    Name = "lh-aws-ssd-volume-${count.index}-${random_string.random_suffix.id}"
-    Owner = var.resources_owner
-  }
-}
-
-resource "aws_ebs_volume" "lh_aws_ssd_volume_v2" {
-
-  count = var.lh_aws_instance_count_worker
-
-  availability_zone = var.aws_availability_zone
-  size              = var.block_device_size_worker
-  type              = "gp2"
-
-  tags = {
-    Name = "lh-aws-ssd-volume-${count.index}-${random_string.random_suffix.id}"
-    Owner = var.resources_owner
-  }
-}
+#resource "aws_ebs_volume" "lh_aws_ssd_volume_v1" {
+#
+#  count = var.lh_aws_instance_count_worker
+#
+#  availability_zone = var.aws_availability_zone
+#  size              = var.block_device_size_worker
+#  type              = "gp2"
+#
+#  tags = {
+#    Name = "lh-aws-ssd-volume-jl-${count.index}-${random_string.random_suffix.id}"
+#    Owner = var.resources_owner
+#  }
+#}
+#
+#resource "aws_ebs_volume" "lh_aws_ssd_volume_v2" {
+#
+#  count = var.lh_aws_instance_count_worker
+#
+#  availability_zone = var.aws_availability_zone
+#  size              = var.block_device_size_worker
+#  type              = "gp2"
+#
+#  tags = {
+#    Name = "lh-aws-ssd-volume-jl-${count.index}-${random_string.random_suffix.id}"
+#    Owner = var.resources_owner
+#  }
+#}
 
 resource "aws_instance" "lh_aws_instance_worker" {
   count = var.lh_aws_instance_count_worker
@@ -181,31 +254,31 @@ resource "aws_instance" "lh_aws_instance_worker" {
   }
 
   tags = {
-    Name = "${var.lh_aws_instance_name_worker}-${count.index}-${random_string.random_suffix.id}"
+    Name = "${var.lh_aws_instance_name_worker}-jl-${count.index}-${random_string.random_suffix.id}"
     DoNotDelete = "true"
     Owner = var.resources_owner
   }
 }
 
-resource "aws_volume_attachment" "lh_aws_ssd_volume_v1_att_k3s" {
-
-  count = var.lh_aws_instance_count_worker
-
-  device_name  = "/dev/xvdb"
-  volume_id    = aws_ebs_volume.lh_aws_ssd_volume_v1[count.index].id
-  instance_id  = aws_instance.lh_aws_instance_worker[count.index].id
-  force_detach = true
-}
-
-resource "aws_volume_attachment" "lh_aws_ssd_volume_v2_att_k3s" {
-
-  count = var.lh_aws_instance_count_worker
-
-  device_name  = "/dev/xvdh"
-  volume_id    = aws_ebs_volume.lh_aws_ssd_volume_v2[count.index].id
-  instance_id  = aws_instance.lh_aws_instance_worker[count.index].id
-  force_detach = true
-}
+#resource "aws_volume_attachment" "lh_aws_ssd_volume_v1_att_k3s" {
+#
+#  count = var.lh_aws_instance_count_worker
+#
+#  device_name  = "/dev/xvdb"
+#  volume_id    = aws_ebs_volume.lh_aws_ssd_volume_v1[count.index].id
+#  instance_id  = aws_instance.lh_aws_instance_worker[count.index].id
+#  force_detach = true
+#}
+#
+#resource "aws_volume_attachment" "lh_aws_ssd_volume_v2_att_k3s" {
+#
+#  count = var.lh_aws_instance_count_worker
+#
+#  device_name  = "/dev/xvdh"
+#  volume_id    = aws_ebs_volume.lh_aws_ssd_volume_v2[count.index].id
+#  instance_id  = aws_instance.lh_aws_instance_worker[count.index].id
+#  force_detach = true
+#}
 
 resource "talos_machine_secrets" "machine_secrets" {}
 
@@ -213,7 +286,7 @@ data "talos_machine_configuration" "controlplane" {
 
   depends_on = [ aws_instance.lh_aws_instance_controlplane ]
 
-  cluster_name       = "lh-tests-cluster"
+  cluster_name       = "lh-tests-jl-cluster"
   cluster_endpoint   = "https://${aws_instance.lh_aws_instance_controlplane[0].public_ip}:6443"
   machine_type       = "controlplane"
   machine_secrets    = talos_machine_secrets.machine_secrets.machine_secrets
@@ -229,7 +302,7 @@ data "talos_machine_configuration" "worker" {
 
   depends_on = [ aws_instance.lh_aws_instance_controlplane ]
 
-  cluster_name       = "lh-tests-cluster"
+  cluster_name       = "lh-tests--jl-cluster"
   cluster_endpoint   = "https://${aws_instance.lh_aws_instance_controlplane[0].public_ip}:6443"
   machine_type       = "worker"
   machine_secrets    = talos_machine_secrets.machine_secrets.machine_secrets
@@ -268,7 +341,7 @@ resource "talos_machine_bootstrap" "this" {
 }
 
 data "talos_client_configuration" "this" {
-  cluster_name         = "lh-tests-cluster"
+  cluster_name         = "lh-tests-jl-cluster"
   client_configuration = talos_machine_secrets.machine_secrets.client_configuration
   endpoints            = aws_instance.lh_aws_instance_controlplane[*].public_ip
 }

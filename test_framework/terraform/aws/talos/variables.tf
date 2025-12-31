@@ -8,19 +8,24 @@ variable "lh_aws_secret_key" {
   description = "AWS SECRET_KEY"
 }
 
+variable "lh_aws_token" {
+  type        = string
+  description = "AWS TOKEN"
+}
+
 variable "aws_region" {
   type        = string
-  default     = "us-east-1"
+  default     = "ap-northeast-3"
 }
 
 variable "aws_availability_zone" {
   type        = string
-  default     = "us-east-1a"
+  default     = "ap-northeast-3a"
 }
 
 variable "lh_aws_vpc_name" {
   type        = string
-  default     = "vpc-lh-tests"
+  default     = "vpc-lh-jl-tests"
 }
 
 variable "arch" {
@@ -31,7 +36,7 @@ variable "arch" {
 
 variable "os_distro_version" {
   type        = string
-  default     = "1.11.5"
+  default     = "1.10.4"
 }
 
 variable "aws_ami_talos_account_number" {
@@ -51,12 +56,12 @@ variable "lh_aws_instance_count_worker" {
 
 variable "lh_aws_instance_name_controlplane" {
   type        = string
-  default     = "lh-tests-controlplane"
+  default     = "lh-tests-jl-controlplane"
 }
 
 variable "lh_aws_instance_name_worker" {
   type        = string
-  default     = "lh-tests-worker"
+  default     = "lh-tests-jl-worker"
 }
 
 variable "lh_aws_instance_type_controlplane" {
@@ -73,17 +78,17 @@ variable "lh_aws_instance_type_worker" {
 
 variable "block_device_size_controlplane" {
   type        = number
-  default     = 64
+  default     = 40
 }
 
 variable "block_device_size_worker" {
   type        = number
-  default     = 40
+  default     = 100
 }
 
 variable "k8s_distro_version" {
   type        = string
-  default     = "v1.34.2"
+  default     = "v1.32.4"
 }
 
 variable "use_hdd" {
